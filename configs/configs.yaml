@@ -23,6 +23,8 @@ buffer:
   max_size: 5e5
   device: ${device}
   storage_device: ${device}
+  online: True
+  update_latents: False
 
 trainer:
   steps: ${env.steps}

@@ -116,7 +116,7 @@ class OnlineTrainer:
         episode_ids = torch.arange(
             envs.env_num, dtype=torch.int32, device=agent.device
         )  # Kept constant so short episodes (< batch_length) remain sampable; RSSM resets via is_first.
-        train_metrics = {}
+        train_metrics = tools.MetricAccumulator()
         agent_state = agent.get_initial_state(envs.env_num)
         # (B, A)
         act = agent_state["prev_action"].clone()
@@ -173,17 +173,15 @@ class OnlineTrainer:
                 else:
                     update_num = self._updates_needed(step)
                 for _ in range(update_num):
-                    _metrics = agent.update(self.replay_buffer)
-                    train_metrics = _metrics
+                    train_metrics.add(agent.update(self.replay_buffer))
                 update_count += update_num
                 # Log training metrics
                 if self._should_log(step):
-                    for name, value in train_metrics.items():
-                        value = tools.to_np(value) if isinstance(value, torch.Tensor) else value
+                    for name, value in train_metrics.mean().items():
                         self.logger.scalar(f"train/{name}", value)
                     self.logger.scalar("train/opt/updates", update_count)
                     if self.video_pred_log:
-                        data, _, initial = self.replay_buffer.sample()
+                        data, _, initial = self.replay_buffer.sample(prefer_online=False)
                         self.logger.video("open_loop", tools.to_np(agent.video_pred(data, initial)))
                     if self.params_hist_log:
                         for name, param in agent._named_params.items():

@@ -138,6 +138,47 @@ def weight_init_(m, fan_type="in"):
             bias.fill_(0.0)
 
 
+class MetricAccumulator:
+    """Interval mean of an update's metrics, accumulated on the device.
+
+    Reading the values on the host each step would force a GPU->CPU sync per metric, so
+    they stay packed as tensors and only `mean()` syncs. Non-tensor entries keep their
+    latest value; min/max entries become the mean of the per-batch min/max, not the
+    interval extremum.
+    """
+
+    def __init__(self):
+        self._keys: tuple[str, ...] | None = None
+        self._sum: torch.Tensor | None = None
+        self._latest: dict[str, float] = {}
+        self._count = 0
+
+    def add(self, metrics):
+        tensors = {k: v for k, v in metrics.items() if isinstance(v, torch.Tensor)}
+        self._latest = {k: v for k, v in metrics.items() if not isinstance(v, torch.Tensor)}
+        keys = tuple(sorted(tensors))
+        if keys != self._keys:
+            # first call, or the metric set changed: start a fresh interval rather than
+            # silently averaging over a different set of keys
+            self._keys = keys
+            self._sum = None
+            self._count = 0
+        packed = torch.stack([tensors[k].detach().reshape(()).float() for k in keys])
+        self._sum = packed if self._sum is None else self._sum + packed
+        self._count += 1
+
+    def mean(self):
+        """Interval means, then reset. Empty dict if nothing was accumulated."""
+        if self._sum is None or self._count == 0:
+            return dict(self._latest)
+        values = (self._sum / self._count).tolist()  # the one sync
+        out = dict(zip(self._keys, values))
+        out.update(self._latest)
+        self._sum = None
+        self._count = 0
+        return out
+
+
 class CudaBenchmark:
     def __init__(self, comment):
         self._comment = comment
