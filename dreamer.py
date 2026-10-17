@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from tensordict import TensorDict
 from torch import nn
-from torch.amp import GradScaler, autocast
+from torch.amp import autocast
 from torch.optim.lr_scheduler import LambdaLR
 
 import networks
@@ -15,6 +15,9 @@ import tools
 from networks import Projector
 from optim import LaProp, clip_grad_agc_
 from tools import to_f32
+
+COMPUTE_DTYPE = torch.bfloat16
+MAX_CONSECUTIVE_NONFINITE = 1000
 
 
 class Dreamer(nn.Module):
@@ -147,7 +150,6 @@ class Dreamer(nn.Module):
             betas=(config.beta1, config.beta2),
             eps=config.eps,
         )
-        self._scaler = GradScaler()
 
         def lr_lambda(step):
             if config.warmup:
@@ -155,6 +157,10 @@ class Dreamer(nn.Module):
             return 1.0
 
         self._scheduler = LambdaLR(self._optimizer, lr_lambda=lr_lambda)
+        # Non-finite gradient bookkeeping (the skip decision already syncs every step).
+        self._nf_tensors = 0  # cumulative non-finite gradient tensors
+        self._nf_skipped = 0  # cumulative updates dropped
+        self._nf_streak = 0  # consecutive updates dropped, reset on any good step
 
         self.train()
         self.clone_and_freeze()
@@ -244,7 +250,12 @@ class Dreamer(nn.Module):
 
     @torch.no_grad()
     def act(self, obs, state, eval=False):
-        """Policy inference step."""
+        """Policy inference step, in COMPUTE_DTYPE like the rest of the model."""
+        with autocast(device_type=self.device.type, dtype=COMPUTE_DTYPE):
+            return self._act(obs, state, eval)
+
+    @torch.no_grad()
+    def _act(self, obs, state, eval=False):
         # obs: dict of (B, *), state: (stoch: (B, S, K), deter: (B, D), prev_action: (B, A))
         torch.compiler.cudagraph_mark_step_begin()
         p_obs = self.preprocess(obs)
@@ -316,9 +327,8 @@ class Dreamer(nn.Module):
         if self.rep_loss == "dreamerpro":
             self.ema_update()
         metrics = {}
-        with autocast(device_type=self.device.type, dtype=torch.float16):
+        with autocast(device_type=self.device.type, dtype=COMPUTE_DTYPE):
             (stoch, deter), mets = self._cal_grad(p_data, initial)
-        self._scaler.unscale_(self._optimizer)  # unscale grads in params
         if self.rep_loss == "dreamerpro" and self._ema_updates < self.freeze_prototypes_iters:
             self._prototypes.grad.zero_()
         if self._log_grads:
@@ -328,13 +338,37 @@ class Dreamer(nn.Module):
             grad_rms = tools.compute_rms(grads)
             mets["opt/grad_norm"] = grad_norm
             mets["opt/grad_rms"] = grad_rms
-        self._agc(self._named_params.values())  # clipping
-        self._scaler.step(self._optimizer)  # update params
-        self._scaler.update()  # adjust scale
-        self._scheduler.step()  # increment scheduler
+        # Drop the update if any gradient is non-finite. bfloat16 rules out overflow but not nan from invalid
+        # ops (0/0, log 0), and nan is absorbing. Must precede AGC, whose 1/max(gnorm/upper, 1) maps inf to
+        # 0*inf = nan. A non-finite element makes its tensor's norm non-finite.
+        _grads = [q.grad for q in self._named_params.values() if q.grad is not None]
+        n_bad = 0
+        if _grads:
+            n_bad = int((~torch.isfinite(torch.stack(torch._foreach_norm(_grads)))).sum())
+        self._nf_tensors += n_bad
+        if n_bad:
+            self._nf_streak += 1
+            self._nf_skipped += 1
+            # optax lets it through past this point; raising avoids a silent nan run.
+            if self._nf_streak > MAX_CONSECUTIVE_NONFINITE:
+                raise RuntimeError(
+                    f"{self._nf_streak} consecutive updates had non-finite gradients "
+                    f"(limit {MAX_CONSECUTIVE_NONFINITE}); refusing to continue."
+                )
+        else:
+            self._nf_streak = 0
+        mets["opt/nonfinite_grads"] = float(n_bad)  # non-finite gradient tensors this step
+        mets["opt/grad_overflow"] = float(n_bad > 0)  # reference's name; 1 => update dropped
+        mets["opt/nonfinite_tensors_total"] = float(self._nf_tensors)
+        mets["opt/nonfinite_streak"] = float(self._nf_streak)
+        mets["opt/updates_skipped"] = float(self._nf_skipped)
+        if not n_bad:
+            self._agc(self._named_params.values())  # clipping
+            self._optimizer.step()  # update params
+            # optax.apply_if_finite leaves the inner state, step count included, untouched.
+            self._scheduler.step()  # increment scheduler
         self._optimizer.zero_grad(set_to_none=True)  # reset grads
         mets["opt/lr"] = self._scheduler.get_lr()[0]
-        mets["opt/grad_scale"] = self._scaler.get_scale()
         if self._log_grads:
             updates = [(new - old) for (new, old) in zip(self._named_params.values(), old_params)]
             update_rms = tools.compute_rms(updates)
@@ -523,7 +557,7 @@ class Dreamer(nn.Module):
         metrics.update(tools.tensorstats(slow_value, "slow_value_replay"))
 
         total_loss = sum([v * self._loss_scales[k] for k, v in losses.items()])
-        self._scaler.scale(total_loss).backward()
+        total_loss.backward()
 
         metrics.update({f"loss/{name}": loss for name, loss in losses.items()})
         metrics.update({"opt/loss": total_loss})

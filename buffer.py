@@ -38,7 +38,7 @@ class Buffer:
         # The initial ones are used only to extract the latent vector
         initial = (sample_td["stoch"][:, 0], sample_td["deter"][:, 0])
         data = sample_td[:, 1:]
-        data.set_("action", sample_td["action"][:, :-1])  # action is 1 step back
+        data.set_("action", sample_td["action"][:, :-1].clone())  # action is 1 step back
         index = [ind.view(-1, self.batch_length + 1)[:, 1:] for ind in info["index"]]
         return data, index, initial
 

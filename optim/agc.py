@@ -37,11 +37,15 @@ def clip_grad_agc_(parameters: _tensor_or_tensors, clip: float, pmin: float, for
         if (foreach is None and _has_foreach_support(device_grads, device)) or (
             foreach and _device_has_foreach_support(device)
         ):
-            pnorm = torch._foreach_norm(device_params, ord=2)
-            gnorm = torch._foreach_norm(device_grads, ord=2)
-            upper = torch._foreach_mul(torch._foreach_maximum(pnorm, pmin), clip)
-            scale = torch._foreach_reciprocal(torch._foreach_maximum(torch._foreach_div(gnorm, upper), 1.0))
-            torch._foreach_mul_(device_grads, scale)
+            # no_grad: the parameters require grad, so computing the scale from
+            # their norms would otherwise attach p.grad to a live autograd graph
+            # (the non-foreach branch below avoids this via g.detach()).
+            with torch.no_grad():
+                pnorm = torch._foreach_norm(device_params, ord=2)
+                gnorm = torch._foreach_norm(device_grads, ord=2)
+                upper = torch._foreach_mul(torch._foreach_maximum(pnorm, pmin), clip)
+                scale = torch._foreach_reciprocal(torch._foreach_maximum(torch._foreach_div(gnorm, upper), 1.0))
+                torch._foreach_mul_(device_grads, scale)
         elif not foreach:
             for p, g in zip(device_params, device_grads):
                 pnorm = torch.norm(p, p=2)

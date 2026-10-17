@@ -38,7 +38,10 @@ class BlockLinear(nn.Module):
         # Store weight in a layout that works with torch's fan calculation.
         # (O/G, I/G, G)
         self.weight = nn.Parameter(torch.empty(self.out_ch // self.blocks, self.in_ch // self.blocks, self.blocks))
-        self.bias = nn.Parameter(torch.empty(self.out_ch))
+        # zeros, not empty: weight_init_ fills the bias with 0 anyway, so this is the same
+        # value in production while keeping the layer usable before any initializer runs.
+        # Left uninitialised, garbage of ~1e31 reached .square() and overflowed float32.
+        self.bias = nn.Parameter(torch.zeros(self.out_ch))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # (..., I)
@@ -398,8 +401,19 @@ class ReturnEMA(nn.Module):
         self.register_buffer("ema_vals", torch.zeros(2, dtype=torch.float32, device=self.device))
 
     def __call__(self, x):
-        x_quantile = torch.quantile(torch.flatten(x.detach()), self.range)
-        # Using out-of-place update for torch.compile compatibility
+        # torch.quantile is not traceable by Dynamo once the input shape becomes
+        # symbolic ("Cannot call numel() on tensor with symbolic sizes/strides"),
+        # and it sorts internally anyway. Only two order statistics are needed,
+        # so sort once and index -- same values, no dynamic-shape landmine.
+        flat = torch.flatten(x.detach())
+        srt, _ = torch.sort(flat)
+        n = srt.shape[0]
+        # linear interpolation, matching torch.quantile's default
+        pos = self.range.to(srt.dtype) * (n - 1)
+        lo = pos.floor().long().clamp_(0, n - 1)
+        hi = pos.ceil().long().clamp_(0, n - 1)
+        frac = pos - pos.floor()
+        x_quantile = srt[lo] + (srt[hi] - srt[lo]) * frac
         self.ema_vals.copy_(self.alpha * x_quantile.detach() + (1 - self.alpha) * self.ema_vals)
         scale = torch.clip(self.ema_vals[1] - self.ema_vals[0], min=1.0)
         offset = self.ema_vals[0]

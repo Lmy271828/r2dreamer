@@ -221,6 +221,11 @@ class RSSM(nn.Module):
 
     def kl_loss(self, post_logit, prior_logit, free):
         kld = dists.kl
+        # Regularise the same distribution we sample from. get_dist applies unimix, so a
+        # KL on raw logits constrains a distribution the model never uses and loses the
+        # floor that keeps a vanishing category from producing an unbounded KL.
+        post_logit = dists.unimix_logits(post_logit, self._unimix_ratio)
+        prior_logit = dists.unimix_logits(prior_logit, self._unimix_ratio)
         rep_loss = kld(post_logit, prior_logit.detach()).sum(-1)
         dyn_loss = kld(post_logit.detach(), prior_logit).sum(-1)
         # Clipped gradients are not backpropagated using torch.clip.

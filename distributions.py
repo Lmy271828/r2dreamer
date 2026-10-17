@@ -13,24 +13,34 @@ def symexp(x):
     return torch.sign(x) * torch.expm1(torch.abs(x))
 
 
+def unimix_logits(logits, ratio):
+    """Mix `ratio` of a uniform into the categorical, returning log-probabilities."""
+    # (..., K) -> (..., K)
+    probs = F.softmax(to_f32(logits), dim=-1)
+    probs = probs * (1.0 - ratio) + torch.ones_like(probs, dtype=torch.float32) * (ratio / probs.shape[-1])
+    return torch.log(probs)
+
+
 class OneHotDist(torchd.one_hot_categorical.OneHotCategorical):
     def __init__(self, logits, unimix_ratio=0.0):
         # (..., K)
-        probs = F.softmax(to_f32(logits), dim=-1)
-        uniform = unimix_ratio / probs.shape[-1]
-        probs = probs * (1.0 - unimix_ratio) + torch.ones_like(probs, dtype=torch.float32) * uniform
-        logits = torch.log(probs)
-        super().__init__(logits=logits)
+        super().__init__(logits=unimix_logits(logits, unimix_ratio))
 
     @property
     def mode(self):
-        # (..., K)
-        _mode = F.one_hot(torch.argmax(self.logits, axis=-1), self.logits.shape[-1])
-        return _mode.detach() + self.logits - self.logits.detach()
+        # (..., K) Hard argmax forward, unperturbed-softmax jacobian backward, as in rsample.
+        probs = torch.softmax(self.logits, -1)
+        value = F.one_hot(torch.argmax(self.logits, dim=-1), self.logits.shape[-1]).to(probs.dtype)
+        return value.detach() + (probs - probs.detach())
 
     def rsample(self, sample_shape=(), temperature=1.0):
-        # (..., K)
-        return F.gumbel_softmax(self.logits, tau=temperature, hard=True, dim=-1)
+        # (..., K) Hard categorical draw forward, unperturbed-softmax jacobian backward.
+        # (probs - probs.detach()) is parenthesised deliberately: it is exactly 0, while
+        # value + probs - probs.detach() would lose ~6e-8 in float32.
+        probs = torch.softmax(self.logits, -1)
+        idx = torch.multinomial(probs.reshape(-1, probs.shape[-1]), 1).reshape(probs.shape[:-1])
+        value = F.one_hot(idx, probs.shape[-1]).to(probs.dtype)
+        return value.detach() + (probs - probs.detach())
 
     def sample(self, **kwargs):
         raise NotImplementedError
@@ -77,24 +87,16 @@ class TwoHot:
 
     def mode(self):
         # (..., N_bins), (N_bins,) -> (..., 1)
+        # The symexp bins are exactly antisymmetric (bins[n-1-i] == -bins[i]), so
+        #     sum_i p_i * b_i  ==  sum_{i<n/2} (p_i - p_{n-1-i}) * b_i  (+ centre)
+        # Cancelling on probabilities, not on ~1e8 products, survives compile reassociation.
         n = self.logits.shape[-1]
+        m = n // 2
+        p_lo = self.probs[..., :m]
+        p_hi = self.probs[..., n - m :].flip(dims=(-1,))
+        wavg = ((p_lo - p_hi) * self.bins[..., :m]).sum(dim=-1, keepdim=True)
         if n % 2 == 1:
-            m = (n - 1) // 2
-            p1 = self.probs[..., :m]
-            p2 = self.probs[..., m : m + 1]
-            p3 = self.probs[..., m + 1 :]
-            b1 = self.bins[..., :m]
-            b2 = self.bins[..., m : m + 1]
-            b3 = self.bins[..., m + 1 :]
-            wavg = (p2 * b2).sum(dim=-1, keepdim=True) + ((p1 * b1).flip(dims=(-1,)) + (p3 * b3)).sum(
-                dim=-1, keepdim=True
-            )
-            return self.unsquash(wavg)
-        p1 = self.probs[..., : n // 2]
-        p2 = self.probs[..., n // 2 :]
-        b1 = self.bins[..., : n // 2]
-        b2 = self.bins[..., n // 2 :]
-        wavg = ((p1 * b1).flip(dims=(-1,)) + (p2 * b2)).sum(dim=-1, keepdim=True)
+            wavg = wavg + self.probs[..., m : m + 1] * self.bins[..., m : m + 1]
         return self.unsquash(wavg)
 
     def log_prob(self, target):
