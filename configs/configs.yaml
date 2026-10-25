@@ -14,15 +14,21 @@ hydra:
   run:
     dir: ${logdir}
 
-batch_size: 16
-batch_length: 64
+batch_size: 8
+batch_length: 32
+
+wandb:
+  enabled: True
+  project: r2dreamer_for_cr
+  entity: lmy03022006-south-china-university-of-technology   # Owner："Muyang Li" 的 wandb slug
+  mode: online          # online / offline / disabled；无凭据时自动降级为 TensorBoard
 
 buffer:
   batch_size: ${batch_size}
   batch_length: ${batch_length}
-  max_size: 5e5
+  max_size: 1e5
   device: ${device}
-  storage_device: ${device}
+  storage_device: 'cpu'
   online: True
   update_latents: False
 
@@ -36,5 +42,5 @@ trainer:
   train_ratio: ${env.train_ratio}
   video_pred_log: False
   params_hist_log: False
-  update_log_every: 5e3
+  update_log_every: 1e3
   action_repeat: ${env.action_repeat}

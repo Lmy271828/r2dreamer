@@ -1,3 +1,6 @@
+import threading
+import time
+
 import torch
 
 import tools
@@ -108,7 +111,6 @@ class OnlineTrainer:
         envs = self.train_envs
         video_cache = []
         step = self.replay_buffer.count() * self._action_repeat
-        update_count = 0
         # (B,)
         done = torch.ones(envs.env_num, dtype=torch.bool, device=agent.device)
         returns = torch.zeros(envs.env_num, dtype=torch.float32, device=agent.device)
@@ -120,6 +122,55 @@ class OnlineTrainer:
         agent_state = agent.get_initial_state(envs.env_num)
         # (B, A)
         act = agent_state["prev_action"].clone()
+
+        # Actor-learner 分离：更新在后台线程执行，采集循环不再被 1-2 秒的
+        # update 阻塞（实测占空 ~29%）。同设备默认流上内核按提交序串行，
+        # act 与 update 并发只造成"内核粒度的新旧权重混读"，单步增量在
+        # 1e-6 lr 量级下无害；buffer 的 add/sample 并发同理属有界噪声。
+        self._learner_stop = threading.Event()
+        shared = {"step": step, "update_count": 0}
+        self._metrics_lock = threading.Lock()
+
+        def learner():
+            local_updates = 0
+            pretrain_used = False
+            try:
+                while not self._learner_stop.is_set() and shared["step"] < self.steps:
+                    step_now = shared["step"]
+                    if step_now // (envs.env_num * self._action_repeat) <= self.batch_length + 1:
+                        time.sleep(0.05)
+                        continue
+                    if not pretrain_used:
+                        update_num = self.pretrain
+                        pretrain_used = True
+                    else:
+                        update_num = int(self._updates_needed(step_now))
+                    for _ in range(update_num):
+                        if self._learner_stop.is_set() or shared["step"] >= self.steps:
+                            break
+                        mets = agent.update(self.replay_buffer)
+                        with self._metrics_lock:
+                            train_metrics.add(mets)
+                        local_updates += 1
+                        shared["update_count"] = local_updates
+                    if update_num == 0:
+                        time.sleep(0.02)
+            except Exception:  # noqa: BLE001 -- 学习线程死亡绝不能静默
+                import traceback
+
+                traceback.print_exc()
+                print(
+                    "learner thread crashed; collection continues without updates "
+                    "(watch train/opt/updates freeze on wandb)",
+                    flush=True,
+                )
+
+        learner_thread = threading.Thread(target=learner, daemon=True, name="learner")
+        learner_thread.start()
+
+        # fps 拆账：分相计时（每 1000 步落一次 p50）
+        phase_ms = {"envs_step": [], "act": [], "buffer_add": [], "misc": []}
+
         while step < self.steps:
             # Evaluation
             if self._should_eval(step) and self.eval_episode_num > 0 and self.eval_envs is not None:
@@ -144,7 +195,9 @@ class OnlineTrainer:
             # on GPU).  The .to() calls below are no-ops when the data is
             # already on agent.device.
             # (B, A), (B,)
+            _t = time.perf_counter()
             trans, step_done = envs.step(act.detach(), done)
+            phase_ms["envs_step"].append((time.perf_counter() - _t) * 1000)
             # dict of (B, 1, *)
             trans = trans.to(agent.device, non_blocking=True)
             # (B,)
@@ -153,7 +206,9 @@ class OnlineTrainer:
             # Policy inference on GPU.
             # "agent_state" is reset by the agent based on the "is_first" flag in trans.
             # (B, A)
+            _t = time.perf_counter()
             act, agent_state = agent.act(trans.clone(), agent_state, eval=False)
+            phase_ms["act"].append((time.perf_counter() - _t) * 1000)
 
             # Store transition.
             # We keep the observation and the action that produced it together.
@@ -164,26 +219,43 @@ class OnlineTrainer:
             trans["episode"] = episode_ids  # Don't lift dim
             if "image" in trans:
                 video_cache.append(trans["image"][0])
+            _t = time.perf_counter()
             self.replay_buffer.add_transition(trans.detach())
+            phase_ms["buffer_add"].append((time.perf_counter() - _t) * 1000)
             returns += trans["reward"][:, 0]
-            # Update models after enough data has accumulated
-            if step // (envs.env_num * self._action_repeat) > self.batch_length + 1:
-                if self._should_pretrain():
-                    update_num = self.pretrain
-                else:
-                    update_num = self._updates_needed(step)
-                for _ in range(update_num):
-                    train_metrics.add(agent.update(self.replay_buffer))
-                update_count += update_num
-                # Log training metrics
-                if self._should_log(step):
-                    for name, value in train_metrics.mean().items():
-                        self.logger.scalar(f"train/{name}", value)
-                    self.logger.scalar("train/opt/updates", update_count)
-                    if self.video_pred_log:
-                        data, _, initial = self.replay_buffer.sample(prefer_online=False)
-                        self.logger.video("open_loop", tools.to_np(agent.video_pred(data, initial)))
-                    if self.params_hist_log:
-                        for name, param in agent._named_params.items():
-                            self.logger.histogram(name, tools.to_np(param))
-                    self.logger.write(step, fps=True)
+            # Actor-learner 分离：更新由后台 learner 线程执行（见上），采集循环零阻塞
+            shared["step"] = step
+            # Log training metrics（指标由 learner 线程在锁内积累）
+            if self._should_log(step):
+                import numpy as _np
+                for pk, pv in phase_ms.items():
+                    if pv:
+                        self.logger.scalar(f"train/timing/{pk}_p50", float(_np.percentile(pv, 50)))
+                        self.logger.scalar(f"train/timing/{pk}_p90", float(_np.percentile(pv, 90)))
+                        phase_ms[pk] = pv[-500:]
+                _step_total = sum(_np.percentile(pv, 50) for pv in phase_ms.values() if pv)
+                self.logger.scalar("train/timing/envs_step_share",
+                                   _np.percentile(phase_ms["envs_step"], 50) / max(1e-9, _step_total)
+                                   if phase_ms["envs_step"] else 0.0)
+                with self._metrics_lock:
+                    mets = train_metrics.mean()
+                for name, value in mets.items():
+                    self.logger.scalar(f"train/{name}", value)
+                self.logger.scalar("train/opt/updates", shared["update_count"])
+                if self.video_pred_log:
+                    data, _, initial = self.replay_buffer.sample(prefer_online=False)
+                    self.logger.video("open_loop", tools.to_np(agent.video_pred(data, initial)))
+                if self.params_hist_log:
+                    for name, param in agent._named_params.items():
+                        self.logger.histogram(name, tools.to_np(param))
+                self.logger.write(step, fps=True)
+
+        # 步数到点：停 learner、收尾排干指标
+        self._learner_stop.set()
+        learner_thread.join(timeout=300)
+        with self._metrics_lock:
+            final_mets = train_metrics.mean()
+        for name, value in final_mets.items():
+            self.logger.scalar(f"train/{name}", value)
+        self.logger.scalar("train/opt/updates", shared["update_count"])
+        self.logger.write(step, fps=True)
