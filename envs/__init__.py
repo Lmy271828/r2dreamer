@@ -9,6 +9,20 @@ def make_envs(config):
     if suite == "isaaclab":
         return _make_isaaclab_envs(config)
 
+    if suite == "firstlight":
+        # 进程内适配器：绕开 ParallelEnv 的多进程管道（长会话下主/子进程
+        # 互等死锁）。多引擎 = 每 env 一个 MuMu 实例（serials/control_ports
+        # 按 env 索引给出），线程池并行步进，socket 等待释放 GIL 真重叠。
+        from envs.firstlight import FirstLightInlineEnv
+
+        env_num = int(getattr(config, "env_num", 1) or 1)
+
+        def firstlight_constructor(idx):
+            return make_env(config, idx)
+
+        env = FirstLightInlineEnv(firstlight_constructor, device=config.device, env_num=env_num)
+        return env, None, env.observation_space, env.action_space
+
     def env_constructor(idx):
         return lambda: make_env(config, idx)
 
@@ -89,6 +103,23 @@ def make_env(config, id):
         import envs.crafter as crafter
 
         env = crafter.Crafter(task, config.size, seed=config.seed + id)
+        env = wrappers.OneHotAction(env)
+    elif suite == "firstlight":
+        import envs.firstlight as firstlight
+
+        serials = list(config.get("serials", []) or [])
+        control_ports = list(config.get("control_ports", []) or [])
+        env = firstlight.FirstLight(
+            task,
+            config.size,
+            seed=config.seed + id,
+            speed=config.speed,
+            capture_backend=config.get("capture", "adb"),
+            deck_mode=config.get("deck_mode", "fixed"),
+            opp_policy=config.get("opp_policy", "afk"),
+            serial=serials[id] if id < len(serials) else None,
+            control_port=control_ports[id] if id < len(control_ports) else None,
+        )
         env = wrappers.OneHotAction(env)
     elif suite == "metaworld":
         import envs.metaworld as metaworld

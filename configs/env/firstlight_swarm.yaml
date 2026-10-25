@@ -1,0 +1,26 @@
+task: 'firstlight_swarm'
+steps: 2e5
+env_num: 1
+eval_episode_num: 0
+action_repeat: 1
+train_ratio: 16
+time_limit: 1300
+
+seed: ${seed}
+device: ${device}
+
+size: [176, 128]
+speed: 2.0
+capture: 'stream'
+deck_mode: 'random'      # 账号卡池解锁后：deck0/deck1 双侧 122 池独立随机
+opp_policy: 'random'     # Native-1 随机合法脚本对手（p_wait=0.3）
+# 每 env 一个 MuMu 实例：env0 = index 1（原实例），env1 = index 0（克隆）
+serials: ['127.0.0.1:16416', '127.0.0.1:16384']
+control_ports: [26789, 26790]
+
+encoder:
+  mlp_keys: '^(elixir|elixir_rate|deck_seq)$'
+  cnn_keys: 'image'
+decoder:
+  mlp_keys: '$^'
+  cnn_keys: 'image'
