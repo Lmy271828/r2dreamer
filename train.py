@@ -32,7 +32,11 @@ def main(config):
 
     print("Logdir", logdir)
 
-    logger = tools.Logger(logdir)
+    logger = tools.Logger(
+        logdir,
+        wandb_config=config.wandb,
+        run_config=__import__("omegaconf", fromlist=["OmegaConf"]).OmegaConf.to_container(config, resolve=True),
+    )
     # save config
     logger.log_hydra_config(config)
 

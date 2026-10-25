@@ -1,5 +1,7 @@
 # Logs / artifacts
 logdir/
+runs/
+align_log/
 *.hydra/
 torch_compile_debug/
 

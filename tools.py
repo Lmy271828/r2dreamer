@@ -4,6 +4,7 @@ import json
 import os
 import random
 import time
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -195,16 +196,58 @@ class CudaBenchmark:
 
 
 class Logger:
-    def __init__(self, logdir, filename="metrics.jsonl"):
+    def __init__(self, logdir, filename="metrics.jsonl", wandb_config=None, run_config=None):
         self._logdir = logdir
         self._filename = filename
         self._writer = SummaryWriter(log_dir=str(logdir), max_queue=1000)
+        self._wandb = self._init_wandb(logdir, wandb_config, run_config)
         self._last_step = None
         self._last_time = None
         self._scalars = {}
         self._images = {}
         self._videos = {}
         self._histograms = {}
+
+    def _init_wandb(self, logdir, wandb_config, run_config):
+        """Start a wandb run when enabled and authenticated; never block training.
+
+        Modes: 'online' uploads (requires `wandb login` or WANDB_API_KEY),
+        'offline' stores locally for later `wandb sync`, 'disabled' skips.
+        Without credentials an 'online' request degrades to disabled with a
+        printed hint instead of hanging on an interactive prompt.
+        """
+
+        self._wandb_module = None
+        if not wandb_config or not wandb_config.get("enabled", False):
+            return None
+        try:
+            import wandb
+        except ImportError:
+            print("wandb is not installed; falling back to TensorBoard/JSONL logging.")
+            return None
+        mode = str(wandb_config.get("mode", "online"))
+        if mode == "online" and not (os.environ.get("WANDB_API_KEY") or wandb.api.api_key):
+            print(
+                "wandb: no credentials found (run `wandb login` or set WANDB_API_KEY); "
+                "falling back to TensorBoard/JSONL logging."
+            )
+            return None
+        try:
+            os.environ.setdefault("WANDB_SILENT", "true")
+            default_name = Path(str(logdir)).as_posix().replace("\\", "/").rstrip("/").split("/")[-1]
+            run = wandb.init(
+                project=wandb_config.get("project", "firstlight-cr"),
+                entity=wandb_config.get("entity") or None,
+                name=wandb_config.get("name") or default_name,
+                config=run_config or {},
+                mode=mode,
+            )
+            print(f"wandb run: {run.url}")
+            self._wandb_module = wandb
+            return run
+        except Exception as error:  # noqa: BLE001 -- logging must never kill training
+            print(f"wandb init failed ({error}); falling back to TensorBoard/JSONL logging.")
+            return None
 
     def scalar(self, name, value):
         self._scalars[name] = float(value)
@@ -241,6 +284,13 @@ class Logger:
             self._writer.add_video(name, value, step, 16)
         for name, value in self._histograms.items():
             self._writer.add_histogram(name, value, step)
+
+        if self._wandb is not None:
+            log = {name: value for name, value in scalars if "/" in name or name.startswith("episode/")}
+            if log:
+                self._wandb.log(log, step=step)
+            for name, value in self._images.items():
+                self._wandb.log({name: self._wandb_module.Image(value)}, step=step)
 
         self._writer.flush()
         self._scalars = {}
