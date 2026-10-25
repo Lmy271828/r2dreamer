@@ -117,6 +117,8 @@ def make_env(config, id):
             capture_backend=config.get("capture", "adb"),
             deck_mode=config.get("deck_mode", "fixed"),
             opp_policy=config.get("opp_policy", "afk"),
+            vm_index=(config.get("vm_indexes", []) or [None] * 8)[id] if id < len(config.get("vm_indexes", []) or []) else None,
+            vm_name=(config.get("vm_names", []) or [None] * 8)[id] if id < len(config.get("vm_names", []) or []) else None,
             serial=serials[id] if id < len(serials) else None,
             control_port=control_ports[id] if id < len(control_ports) else None,
         )

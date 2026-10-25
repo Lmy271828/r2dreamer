@@ -153,6 +153,11 @@ class OnlineTrainer:
                             train_metrics.add(mets)
                         local_updates += 1
                         shared["update_count"] = local_updates
+                        if local_updates % 64 == 0:  # ~7 分钟一次的崩溃保险
+                            torch.save(
+                                {"agent_state_dict": agent.state_dict(),
+                                 "optims_state_dict": tools.recursively_collect_optim_state_dict(agent)},
+                                self.logger._logdir / "latest.pt")
                     if update_num == 0:
                         time.sleep(0.02)
             except Exception:  # noqa: BLE001 -- 学习线程死亡绝不能静默

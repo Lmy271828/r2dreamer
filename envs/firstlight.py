@@ -51,6 +51,16 @@ DECKS = {
     "swarm": (26000012, 26000041, 26000022, 26000010, 26000007, 28000010, 28000000, 26000000),
     "standard": (26000000, 26000001, 26000005, 28000001, 28000000, 26000003, 26000014, 26000018),
 }
+def _load_card_names():
+    try:
+        from native_runner.card_names import CARD_NAMES
+
+        return set(CARD_NAMES)
+    except Exception:
+        return set()
+
+
+CARD_NAMES_ALL = _load_card_names()
 FIRST_PLAYABLE_TICK = 90
 GRID_W, GRID_H = 18, 32
 CELLS = GRID_W * GRID_H
@@ -61,11 +71,10 @@ ARENA_CROP = (111, 430, 967, 1620)
 def _load_deck_pool():
     """对手侧随机卡组池 = 卡牌目录 ∩ 竞技支持白名单（剔除 Super*/禁用卡）。
 
-    关键约束（实测）：deck0 走 guest 账号的现役卡组（被钉死为 swarm），
-    native-render 建局时校验账号卡池；deck1（对手）由引擎按配置构造，
-    只受引擎卡牌支持面约束，可用全支持池。
+    账号卡池已解锁（T4 实测双侧全随机通过）：池 = 全部受支持卡牌，
+    deck0/deck1 都可用。
     """
-    ids = set(DECKS["swarm"]) | set(DECKS["standard"])
+    ids = set(CARD_NAMES_ALL)
     try:
         from native_runner.card_names import CARD_NAMES
 
@@ -78,6 +87,7 @@ def _load_deck_pool():
         )
         supported = {int(c["card_id"]) for c in sup.get("supported_cards", [])}
         ids &= supported
+        ids -= {i for i in ids if 27000000 <= i < 27000100}  # 冠军卡：建局校验未过，先剔除
     except Exception:
         pass
     return tuple(sorted(ids)) if ids else ()
@@ -184,6 +194,8 @@ class FirstLight(gym.Env):
         control_port=None,
         deck_mode="fixed",
         opp_policy="afk",
+        vm_index=None,
+        vm_name=None,
     ):
         self._task = task
         self._deck0 = DECKS.get(task, DECKS["swarm"])
@@ -198,8 +210,12 @@ class FirstLight(gym.Env):
         self._opp_plays = 0
         self._opp_last = "init"
         self._swap_next = False  # 换边双打：下局 deck0/deck1 互换
+        self._deck_override = None   # 换边双打 harness：显式指定下局双方卡组
+        self._seed_override = None
         # 多实例：serial/control_port 覆盖 .env 的单实例默认值
         self._serial_override = serial
+        self._vm_index = int(vm_index) if vm_index is not None else None
+        self._vm_name = vm_name
         self._control_port = int(control_port) if control_port else None
         # M1 对齐旁路日志：每步记录 (tick, 帧龄, 流状态)，量化图像↔tick 组内偏移
         self._last_frame_meta = None
@@ -238,15 +254,17 @@ class FirstLight(gym.Env):
                 if sock.connect_ex(("127.0.0.1", self._control_port)) == 0:
                     return
         script = Path(FIRSTLIGHT_ROOT) / "native_runner" / "start_offline.ps1"
-        subprocess.run(
-            [
-                "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                "-File", str(script),
-                "-ControlPort", str(self._control_port),
-            ],
-            check=False,
-            timeout=900,
-        )
+        cmd = [
+            "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+            "-File", str(script),
+            "-ControlPort", str(self._control_port),
+            "-Serial", self._serial,
+        ]
+        if self._vm_index is not None:
+            cmd += ["-VmIndex", str(self._vm_index)]
+        if self._vm_name:
+            cmd += ["-VmName", self._vm_name]
+        subprocess.run(cmd, check=False, timeout=900)
 
     def _ensure_battle(self, restart: bool = False):
         if self._battle is None:
@@ -499,23 +517,37 @@ class FirstLight(gym.Env):
             self._battle = None
             return self._reset_inner(restart=True)
 
-    def _reset_inner(self, restart=False):
-        self._ensure_battle(restart=restart)
-        self._ensure_stream()  # 流编码器预热（~1s）与引擎 reset/热身并行
-        self._episodes += 1
-        seed = self._seed_base + self._episodes * 7919
+    def _sample_decks(self, seed):
+        """按 deck_mode 采样双方卡组（fixed 模式保持构造时的组态）。"""
         if self._deck_mode == "random":
-            # 账号卡池已解锁（实测 T4 双侧全随机通过）：deck0/deck1 独立采样
             if not DECK_POOL:
                 raise RuntimeError("deck_mode=random but card pool is empty")
-            rng = np.random.default_rng(seed)  # 种子化：同 seed 可复现同一对卡组
+            rng = np.random.default_rng(seed)
             self._deck0 = tuple(int(c) for c in rng.choice(DECK_POOL, size=8, replace=False))
             self._deck1 = tuple(int(c) for c in rng.choice(DECK_POOL, size=8, replace=False))
         elif self._deck_mode.startswith("random_opp"):
             pool = DECK_POOL_OWNED if self._deck_mode == "random_opp_owned" else DECK_POOL
             rng = np.random.default_rng(seed)
             self._deck1 = tuple(int(c) for c in rng.choice(pool, size=8, replace=False))
-        # 换边双打：swap_next=True 时同 seed 下 deck0/deck1 互换座位
+
+    def set_next_match(self, deck0, deck1, seed=None):
+        """换边双打 harness：显式指定下一局的双方卡组与 seed（优先于采样）。"""
+        self._deck_override = (tuple(int(c) for c in deck0), tuple(int(c) for c in deck1))
+        self._seed_override = int(seed) if seed is not None else None
+
+    def _reset_inner(self, restart=False):
+        self._ensure_battle(restart=restart)
+        self._ensure_stream()  # 流编码器预热（~1s）与引擎 reset/热身并行
+        self._episodes += 1
+        seed = self._seed_base + self._episodes * 7919
+        if self._deck_override:
+            self._deck0, self._deck1 = self._deck_override
+            self._deck_override = None
+            if self._seed_override is not None:
+                seed = self._seed_override
+                self._seed_override = None
+        else:
+            self._sample_decks(seed)
         deck0, deck1 = (self._deck1, self._deck0) if self._swap_next else (self._deck0, self._deck1)
         self._swap_next = False
         reset_kwargs = {
