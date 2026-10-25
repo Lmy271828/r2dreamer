@@ -1,5 +1,7 @@
 import math
+import os
 import re
+import sys
 from functools import partial
 
 import torch
@@ -127,6 +129,16 @@ class MultiEncoder(nn.Module):
             self.encoders.append(MLP(config.mlp, inp_dim))
             self.selectors.append(lambda obs: torch.cat([obs[k] for k in self.mlp_shapes], -1))
             self.out_dim += self.encoders[-1].out_dim
+        # M3: deck_ids 卡牌嵌入分支（索引键，不进数值 MLP）。
+        # 词表大小来自卡池长度（=env 发出的索引域），不是每局卡数 8。
+        self.deck_key = "deck_ids" if any(k == "deck_ids" for k in shapes) else None
+        if self.deck_key:
+            num_cards = shapes["deck_ids"][0]
+            dim = int(getattr(config, "deck_emb_dim", 16))
+            self.deck_embedder = DeckEmbedder(len(_deck_pool_ids()) + 1, dim, num_cards)
+            self.encoders.append(self.deck_embedder)
+            self.selectors.append(lambda obs: obs[self.deck_key])
+            self.out_dim += self.deck_embedder.out_dim
         self.encoders = nn.ModuleList(self.encoders)
 
         if len(self.encoders) > 1:
@@ -374,10 +386,66 @@ class MLPHead(nn.Module):
             with torch.no_grad():
                 self.last.weight.mul_(self._outscale)
 
-    def forward(self, x):
-        """Produce a distribution head."""
+    def forward(self, x, mask=None):
+        """Produce a distribution head.
+
+        mask (..., A) optional legality gate for discrete heads: illegal
+        logits are flooded to -1e9 BEFORE unimix.  Finite flooding (not
+        -inf) keeps categorical entropy nan-free (0 * -1e9 is 0, while
+        0 * -inf is nan), and the residual unimix floor (~eps/K per
+        illegal action, ~4e-6 here) degrades to WAIT behaviourally
+        anyway.
+        """
         # (B, T, F)
-        return self._dist(self.last(self.mlp(x)))
+        logits = self.last(self.mlp(x))
+        if mask is not None:
+            logits = logits.masked_fill(mask <= 0, -1e9)
+        return self._dist(logits)
+
+
+def _deck_pool_ids():
+    """M3 卡牌词表 = FirstLight 竞技支持白名单 ∩ 卡牌目录。
+    与 envs/firstlight.DECK_POOL 保持一致（deck_ids 索引即该池下标）。"""
+    import json
+
+    root = os.environ.get("CR_FIRSTLIGHT_ROOT", "D:/pynoob/FirstLight/FirstLight_CR")
+    ids = set()
+    try:
+        from native_runner.card_names import CARD_NAMES  # noqa: PLC0415 -- 需 FirstLight 路径已注入
+
+        sys_path = str(root)
+        if sys_path not in sys.path:
+            sys.path.insert(0, sys_path)
+        from native_runner.card_names import CARD_NAMES as NAMES  # noqa: F811
+
+        ids = set(NAMES)
+    except Exception:
+        pass
+    try:
+        sup = json.loads(open(os.path.join(root, "native_runner", "data", "competitive", "card_support.json")).read())
+        ids &= {int(c["card_id"]) for c in sup.get("supported_cards", [])}
+    except Exception:
+        pass
+    return tuple(sorted(ids))
+
+
+class DeckEmbedder(nn.Module):
+    """M3: deck_ids (B, T, C) 索引 → (B, T, C*dim) 学习卡牌嵌入。
+
+    索引由 env 侧按 DECK_POOL 下标发出（紧凑、float32 安全）；词表多出的
+    0 号位保留给未知卡。机制语义（费用/射程等）不注入，由世界模型损失
+    隐式学习——这是 M3 的研究主张。
+    """
+
+    def __init__(self, vocab_size: int, dim: int, num_cards: int):
+        super().__init__()
+        self.emb = nn.Embedding(vocab_size, dim)
+        self.num_cards = num_cards
+        self.out_dim = dim * num_cards
+
+    def forward(self, ids):
+        x = self.emb(ids.long())
+        return x.reshape(*x.shape[:-2], -1)
 
 
 class Projector(nn.Module):

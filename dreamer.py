@@ -270,7 +270,9 @@ class Dreamer(nn.Module):
         stoch, deter, _ = self._frozen_rssm.obs_step(prev_stoch, prev_deter, prev_action, embed, obs["is_first"])
         # (B, F)
         feat = self._frozen_rssm.get_feat(stoch, deter)
-        action_dist = self._frozen_actor(feat)
+        # M2: 观测自带的合法性掩码（B, 2305），非法 logit 在头内被淹没
+        mask = obs.get("action_mask", None) if hasattr(obs, "get") else None
+        action_dist = self._frozen_actor(feat, mask=mask)
         # (B, A)
         action = action_dist.mode if eval else action_dist.rsample()
         return action, TensorDict(
@@ -475,7 +477,18 @@ class Dreamer(nn.Module):
             post_deter.reshape(-1, *post_deter.shape[2:]).detach(),
         )
         # (B, T, ...) -> (B*T, ...)
-        imag_feat, imag_action = self._imagine(start, self.imag_horizon + 1)
+        # M2: 想象轨迹的合法掩码——用采集时掩码沿时间轴前向对齐（近似：
+        # 掩码沿轨迹缓变，槽位/放置区只在出牌后变化）。首步严格，后续步为
+        # 有界的启发式；未提供掩码时退化为无掩码。
+        masks = data.get("action_mask", None)
+        imag_masks = None
+        if masks is not None:
+            H = self.imag_horizon + 1
+            Tm = masks.shape[1]
+            idx = (torch.arange(Tm, device=masks.device).unsqueeze(0)
+                   + torch.arange(H, device=masks.device).unsqueeze(1)).clamp(max=Tm - 1)
+            imag_masks = masks[:, idx].reshape(-1, H, masks.shape[-1])  # (B*T, H, A)
+        imag_feat, imag_action = self._imagine(start, self.imag_horizon + 1, masks=imag_masks)
         imag_feat, imag_action = imag_feat.detach(), imag_action.detach()
 
         # (B*T, T_imag, 1)
@@ -497,7 +510,7 @@ class Dreamer(nn.Module):
         # (B*T, T_imag-1, 1)
         adv = (ret - imag_value[:, :-1]) / ret_scale
 
-        policy = self.actor(imag_feat)
+        policy = self.actor(imag_feat, mask=imag_masks)
         # (B*T, T_imag-1, 1)
         logpi = policy.log_prob(imag_action)[:, :-1].unsqueeze(-1)
         entropy = policy.entropy()[:, :-1].unsqueeze(-1)
@@ -564,17 +577,18 @@ class Dreamer(nn.Module):
         return (post_stoch, post_deter), metrics
 
     @torch.no_grad()
-    def _imagine(self, start, imag_horizon):
+    def _imagine(self, start, imag_horizon, masks=None):
         """Roll out the policy in latent space."""
         # (B, S, K), (B, D)
         feats = []
         actions = []
         stoch, deter = start
-        for _ in range(imag_horizon):
+        for step in range(imag_horizon):
             # (B, F)
             feat = self._frozen_rssm.get_feat(stoch, deter)
-            # (B, A)
-            action = self._frozen_actor(feat).rsample()
+            # (B, A) — M2: 逐步注入该步的合法掩码
+            mask = masks[:, step] if masks is not None else None
+            action = self._frozen_actor(feat, mask=mask).rsample()
             # Append feat and its corresponding sampled action at the same time step.
             feats.append(feat)
             actions.append(action)
