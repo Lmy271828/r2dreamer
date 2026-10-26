@@ -101,6 +101,37 @@ DECK_INDEX = {card: i for i, card in enumerate(DECK_POOL)}                 # 对
 DECK_POOL_OWNED = tuple(sorted(set(DECKS["swarm"]) | set(DECKS["standard"])))
 
 
+class ElixirLedger:
+    """圣水账本：初始 5 + ELIXIR_SEGMENTS 阶段积分 - 我方出牌费用。
+
+    规则可计算、零传感器（部署语义：真手机上同样成立）。探针的
+    elixir_exact 降级为对账校验器：drift = engine - ledger，非零即漏记了
+    圣水收集器涌出等事件。
+    """
+
+    def __init__(self):
+        self.reset(start_tick=0)
+
+    def reset(self, start_tick: int = 0, anchor_value: float | None = None, anchor_tick: int | None = None):
+        # 锚定一次引擎真值后纯规则积分：base = 锚点圣水 - 锚点前已产出
+        from native_runner.battle_env import _elixir_generated_raw
+
+        self.start_tick = 0
+        self.anchor_tick = int(anchor_tick or start_tick)
+        gen = _elixir_generated_raw(0, self.anchor_tick) / 10_000.0
+        self.base = (float(anchor_value) - gen) if anchor_value is not None else 5.0
+        self.spent = 0.0
+
+    def record_play(self, cost: float):
+        self.spent += float(cost)
+
+    def value(self, tick: int) -> float:
+        from native_runner.battle_env import _elixir_generated_raw
+
+        raw = _elixir_generated_raw(0, int(tick)) / 10_000.0
+        return float(np.clip(self.base + raw - self.spent, 0.0, 10.0))
+
+
 class FirstLightInlineEnv:
     """In-process N-env adapter mirroring ParallelEnv's trainer surface.
 
@@ -220,12 +251,15 @@ class FirstLight(gym.Env):
         self._vm_index = int(vm_index) if vm_index is not None else None
         self._vm_name = vm_name
         self._control_port = int(control_port) if control_port else None
+        self._binding_fingerprint = None
         # M1 对齐旁路日志：每步记录 (tick, 帧龄, 流状态)，量化图像↔tick 组内偏移
         self._last_frame_meta = None
         self._align_path = None
         self._stream = None
         self._capture_fallbacks = 0
         self._last_obs = None
+        self._ledger = ElixirLedger()
+        self._elixir_drift = 0.0
         self._episodes = 0
         self._battle = None
         self._mask = None
@@ -248,6 +282,45 @@ class FirstLight(gym.Env):
         self._serial = self._serial_override or setting("CR_ADB_SERIAL") or "127.0.0.1:16416"
         self._control_port = self._control_port or int(setting("CR_CONTROL_PORT", "26789"))
 
+    def _adb_cmd(self, *args, timeout=10.0):
+        return subprocess.run(
+            [self._adb, *args], capture_output=True, text=True, timeout=timeout, check=False
+        )
+
+    def _verify_binding(self):
+        """实例绑定校验：serial 在线 + 控制端口的 forward 归属正确。
+
+        防"连错实例"：控制端口被残留实例的 forward 占用、或 serial 被换成
+        另一个 MuMu guest 时，探针照样能连上，但轨迹来自错误引擎。校验失败
+        抛 RuntimeError，由调用方走 start_offline 重启（它会重建正确的
+        forward 并校验 VM 名）。
+        """
+        from native_runner.local_config import setting
+        listed = self._adb_cmd("devices").stdout.splitlines()
+        rows = [line.split() for line in listed if len(line.split()) == 2]
+        state = next((s for serial, s in rows if serial == self._serial), None)
+        if state != "device":
+            raise RuntimeError(
+                f"adb serial {self._serial} not online (state={state!r}); "
+                f"visible: {[r[0] for r in rows]}"
+            )
+        guest_port = int(setting("CR_GUEST_CONTROL_PORT", "26789"))
+        fwd = [
+            line.split()
+            for line in self._adb_cmd("-s", self._serial, "forward", "--list").stdout.splitlines()
+            if len(line.split()) >= 3
+        ]
+        host, guest = f"tcp:{self._control_port}", f"tcp:{guest_port}"
+        if not any(r[0] == self._serial and r[1] == host and r[2] == guest for r in fwd):
+            raise RuntimeError(
+                f"control port {self._control_port} forward missing/mismatched for "
+                f"{self._serial} (expected {host}->{guest}; got {fwd})"
+            )
+        if getattr(self, "_binding_fingerprint", None) != self._serial:
+            model = (self._adb_cmd("-s", self._serial, "shell", "getprop", "ro.product.model").stdout or "").strip()
+            self._binding_fingerprint = self._serial
+            print(f"FirstLight: bound to {self._serial} ({model}), control {host}->{guest}", flush=True)
+
     def _ensure_engine(self, restart: bool = False):
         import socket
 
@@ -255,7 +328,16 @@ class FirstLight(gym.Env):
             with socket.socket() as sock:
                 sock.settimeout(2.0)
                 if sock.connect_ex(("127.0.0.1", self._control_port)) == 0:
-                    return
+                    try:
+                        self._verify_binding()
+                        return
+                    except (RuntimeError, subprocess.TimeoutExpired) as error:
+                        print(
+                            f"FirstLight: binding check failed ({str(error)[:160]}); "
+                            "re-provisioning engine...",
+                            flush=True,
+                        )
+                        # 落到下方 start_offline：重启并重建 forward
         script = Path(FIRSTLIGHT_ROOT) / "native_runner" / "start_offline.ps1"
         cmd = [
             "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
@@ -360,7 +442,7 @@ class FirstLight(gym.Env):
             self._opp_last = f"err:{str(error)[:60]}"
             return self._action_v1.wait(1, ticks=10, execute_offset_ticks=3)
 
-    def _align_log_tick(self, tick):
+    def _align_log_tick(self, tick, engine_elixir=None):
         """M1 对齐旁路：被动记录每步的引擎 tick 与帧龄。
 
         图像内容 tick ≈ obs0.tick - age_s × speed / 0.05（帧在流管线里晚到
@@ -380,6 +462,10 @@ class FirstLight(gym.Env):
             "speed": self._speed,
             "opp_plays": self._opp_plays,
             "opp_last": self._opp_last,
+            "elixir": round(self._ledger.value(tick), 3),
+            "elixir_drift": round(
+                (float(engine_elixir) if engine_elixir is not None else 0.0)
+                - self._ledger.value(tick), 3),
         })
         with open(self._align_path, "a") as f:
             f.write(line + "\n")
@@ -591,22 +677,23 @@ class FirstLight(gym.Env):
         self._battle.native.set_speed(self._speed)       # 游玩期速度（引擎保持运行）
         self._mask = self._battle.action_mask(0)
         native_now = self._battle.native.observe()
+        # 账本锚定：用新鲜的 elixirRaw（引擎真值），一次性吸收开局差异
+        _el = next(p for p in native_now["players"] if p["owner"] == 0)
+        self._ledger.reset(anchor_value=float(_el.get("elixirRaw", 50_000)) / 10_000.0,
+                           anchor_tick=obs0.tick)
         image = self._capture()
         obs = {
             "image": image,
             "is_first": np.bool_(True),
             "is_last": np.bool_(False),
             "is_terminal": np.bool_(False),
-            "elixir": np.array(
-                [next(p for p in obs0.players if p.owner == 0).elixir_exact or 0.0],
-                dtype=np.float32,
-            ),
+            "elixir": np.array([self._ledger.value(obs0.tick)], dtype=np.float32),
             "elixir_rate": np.array([self._elixir_rate(obs0.tick)], dtype=np.float32),
             "hand_ids": self._hand_ids(native_now),
             "deck_ids": np.array([DECK_INDEX[c] for c in self._deck0], dtype=np.int64),
             "action_mask": self._mask_flat(),
         }
-        self._align_log_tick(obs0.tick)
+        self._align_log_tick(obs0.tick, engine_elixir=float(next(p for p in obs0.players if p.owner == 0).elixir_exact or 0.0))
         self._last_obs = obs
         return obs
 
@@ -672,6 +759,7 @@ class FirstLight(gym.Env):
         if legal:
             rp0 = next(p for p in native_now["players"] if p["owner"] == 0)
             hand_card = next(c for c in rp0["hand"] if c["handIndex"] == slot)
+            play_cost = float(hand_card.get("cost") or 0.0)
             # next_decision_ticks=10：固定 10 tick 决策节奏（2Hz@speed 1.0）——保证对局在
             # time_limit 内到达终局（±1 奖励才存在），并与 4Hz 协议一致
             play = self._action_v1.play(
@@ -686,6 +774,7 @@ class FirstLight(gym.Env):
                 offset = 1 + attempt * 2
                 try:
                     result = self._battle.step_actor(0, with_opp([replace(play, execute_offset_ticks=offset)]))
+                    self._ledger.record_play(play_cost)
                     break
                 except BattleEnvError as error:
                     # 决策死线竞态（偶发）：降级为等待。环境绝不因智能体动作而崩溃。
@@ -716,16 +805,13 @@ class FirstLight(gym.Env):
             "is_first": np.bool_(False),
             "is_last": np.bool_(done),
             "is_terminal": np.bool_(terminated),
-            "elixir": np.array(
-                [player.elixir_exact if player.elixir_exact is not None else 0.0],
-                dtype=np.float32,
-            ),
+            "elixir": np.array([self._ledger.value(obs0.tick)], dtype=np.float32),
             "elixir_rate": np.array([self._elixir_rate(obs0.tick)], dtype=np.float32),
             "hand_ids": self._hand_ids(native_now),
             "deck_ids": np.array([DECK_INDEX[c] for c in self._deck0], dtype=np.int64),
             "action_mask": self._mask_flat(),
         }
-        self._align_log_tick(obs0.tick)
+        self._align_log_tick(obs0.tick, engine_elixir=float(next(p for p in obs0.players if p.owner == 0).elixir_exact or 0.0))
         self._last_obs = obs
         if done and self._episodes % 20 == 0:  # 每 20 局采样一次终局诊断
             try:
