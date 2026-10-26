@@ -12,8 +12,15 @@ Illegal indices degrade to WAIT; dynamic masking is layered onto the actor
 in the M2 changes (the flattened mask is exposed as obs["action_mask"]).
 
 Structured side channels (encoded by the MLP encoder, not the CNN):
-  elixir      -- own exact elixir (explicit interface; using it is optional)
-  elixir_rate -- current elixir growth rate in elixir/second
+  elixir      -- own elixir. Source is CR_ELIXIR_SOURCE (default "probe"):
+                 the probe's authoritative value (covers Elixir Collector,
+                 Elixir Golem refunds, and every other event-driven gain);
+                 "ledger" switches back to the rule-integrated ElixirLedger
+                 (deployment-faithful, but blind to event-driven elixir).
+                 The ledger always keeps running as a drift auditor --
+                 probe - ledger is logged per step.
+  elixir_rate -- current elixir growth rate in elixir/second (rule-based:
+                 the probe exposes no rate; collector ticks are absent here)
   hand_ids    -- current hand card pool indices (4, 0 = empty/UNK)
   deck_ids    -- own deck pool indices (8) for critic deck conditioning
 
@@ -102,11 +109,13 @@ DECK_POOL_OWNED = tuple(sorted(set(DECKS["swarm"]) | set(DECKS["standard"])))
 
 
 class ElixirLedger:
-    """圣水账本：初始 5 + ELIXIR_SEGMENTS 阶段积分 - 我方出牌费用。
+    """圣水规则账本：锚点值 + ELIXIR_SEGMENTS 阶段积分 - 我方出牌费用。
 
-    规则可计算、零传感器（部署语义：真手机上同样成立）。探针的
-    elixir_exact 降级为对账校验器：drift = engine - ledger，非零即漏记了
-    圣水收集器涌出等事件。
+    零传感器、部署通用，但**看不见事件式产出**（圣水收集器涌出、圣水
+    哥勒姆死亡返还、克隆/镜像复制等），因此 obs 主通道默认是探针真值
+    （CR_ELIXIR_SOURCE=probe，见 _probe_elixir）。账本降级为纯审计器：
+    drift = probe - ledger 每步入 align 日志，drift 非零即存在账本盲区
+    事件（或引擎/管线退化），是免费的管线健康指标。
     """
 
     def __init__(self):
@@ -519,6 +528,17 @@ class FirstLight(gym.Env):
 
         return float(_elixir_raw_per_tick(int(tick))) * 20.0 / 10000.0
 
+    def _probe_elixir(self, player, tick):
+        """圣水主通道：探针真值（CR_ELIXIR_SOURCE=ledger 时退回规则账本）。
+
+        账本永远照常积分，供 drift 审计；探针缺读数（理论不发生）时也退回
+        账本，保证 obs 键恒有值。
+        """
+        exact = getattr(player, "elixir_exact", None)
+        if os.environ.get("CR_ELIXIR_SOURCE", "probe") == "probe" and exact is not None:
+            return float(np.clip(float(exact), 0.0, 10.0))
+        return float(self._ledger.value(int(tick)))
+
     def _mask_flat(self):
         flat = np.zeros(1 + 4 * CELLS, dtype=np.uint8)
         flat[0] = 1  # WAIT is always legal
@@ -682,12 +702,13 @@ class FirstLight(gym.Env):
         self._ledger.reset(anchor_value=float(_el.get("elixirRaw", 50_000)) / 10_000.0,
                            anchor_tick=obs0.tick)
         image = self._capture()
+        obs0_player = next(p for p in obs0.players if p.owner == 0)
         obs = {
             "image": image,
             "is_first": np.bool_(True),
             "is_last": np.bool_(False),
             "is_terminal": np.bool_(False),
-            "elixir": np.array([self._ledger.value(obs0.tick)], dtype=np.float32),
+            "elixir": np.array([self._probe_elixir(obs0_player, obs0.tick)], dtype=np.float32),
             "elixir_rate": np.array([self._elixir_rate(obs0.tick)], dtype=np.float32),
             "hand_ids": self._hand_ids(native_now),
             "deck_ids": np.array([DECK_INDEX[c] for c in self._deck0], dtype=np.int64),
@@ -805,7 +826,7 @@ class FirstLight(gym.Env):
             "is_first": np.bool_(False),
             "is_last": np.bool_(done),
             "is_terminal": np.bool_(terminated),
-            "elixir": np.array([self._ledger.value(obs0.tick)], dtype=np.float32),
+            "elixir": np.array([self._probe_elixir(player, obs0.tick)], dtype=np.float32),
             "elixir_rate": np.array([self._elixir_rate(obs0.tick)], dtype=np.float32),
             "hand_ids": self._hand_ids(native_now),
             "deck_ids": np.array([DECK_INDEX[c] for c in self._deck0], dtype=np.int64),
