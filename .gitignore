@@ -1,6 +1,8 @@
 # Logs / artifacts
 logdir/
 runs/
+checkpoints/
+*.pt
 align_log/
 *.hydra/
 torch_compile_debug/
