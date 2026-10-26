@@ -10,7 +10,10 @@ if [ -e "$LOGDIR" ]; then
   exit 1
 fi
 echo "logdir: $LOGDIR"
-exec python -u train.py \
+# Python 解析：优先 $PYTHON，其次 FirstLight venv，最后 PATH 上的 python
+PY="${PYTHON:-../FirstLight/FirstLight_CR/.venv/Scripts/python.exe}"
+[ -x "$PY" ] || PY="$(command -v python)"
+exec "$PY" -u train.py \
   env=firstlight_swarm \
   model.rep_loss=r2dreamer \
   model.compile=False \

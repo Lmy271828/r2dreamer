@@ -129,16 +129,6 @@ class MultiEncoder(nn.Module):
             self.encoders.append(MLP(config.mlp, inp_dim))
             self.selectors.append(lambda obs: torch.cat([obs[k] for k in self.mlp_shapes], -1))
             self.out_dim += self.encoders[-1].out_dim
-        # M3: deck_ids 卡牌嵌入分支（索引键，不进数值 MLP）。
-        # 词表大小来自卡池长度（=env 发出的索引域），不是每局卡数 8。
-        self.deck_key = "deck_ids" if any(k == "deck_ids" for k in shapes) else None
-        if self.deck_key:
-            num_cards = shapes["deck_ids"][0]
-            dim = int(getattr(config, "deck_emb_dim", 16))
-            self.deck_embedder = DeckEmbedder(len(_deck_pool_ids()) + 1, dim, num_cards)
-            self.encoders.append(self.deck_embedder)
-            self.selectors.append(lambda obs: obs[self.deck_key])
-            self.out_dim += self.deck_embedder.out_dim
         self.encoders = nn.ModuleList(self.encoders)
 
         if len(self.encoders) > 1:
@@ -429,23 +419,50 @@ def _deck_pool_ids():
     return tuple(sorted(ids))
 
 
-class DeckEmbedder(nn.Module):
-    """M3: deck_ids (B, T, C) 索引 → (B, T, C*dim) 学习卡牌嵌入。
+class CardEmbeddingTable(nn.Module):
+    """M4 卡牌共享嵌入表：actor 候选打分、critic 卡组条件、未来卡组池共用同一张表。
 
-    索引由 env 侧按 DECK_POOL 下标发出（紧凑、float32 安全）；词表多出的
-    0 号位保留给未知卡。机制语义（费用/射程等）不注入，由世界模型损失
-    隐式学习——这是 M3 的研究主张。
+    - 词表 0 号位 = UNK/空槽；e_wait 是与卡牌同维的可学习等待令牌，
+      在候选集里占 0 号位（softmax 里与出牌候选同台竞争）
+    - 查询与候选各自 LayerNorm + L2 归一化后做余弦点积，乘可学习温度
+      τ = exp(log_temperature)（初始 1.0）——无界点积会让熵塌缩
     """
 
-    def __init__(self, vocab_size: int, dim: int, num_cards: int):
+    def __init__(self, vocab_size: int, dim: int):
         super().__init__()
+        self.vocab_size = vocab_size
+        self.dim = dim
         self.emb = nn.Embedding(vocab_size, dim)
-        self.num_cards = num_cards
-        self.out_dim = dim * num_cards
+        nn.init.normal_(self.emb.weight, std=0.02)
+        self.wait_token = nn.Parameter(torch.zeros(dim))
+        nn.init.normal_(self.wait_token, std=0.02)
+        self.norm = nn.LayerNorm(dim)
+        self.log_temperature = nn.Parameter(torch.zeros(1))
 
-    def forward(self, ids):
-        x = self.emb(ids.long())
-        return x.reshape(*x.shape[:-2], -1)
+    def _norm(self, x):
+        import torch.nn.functional as F
+
+        return F.normalize(self.norm(x), dim=-1)
+
+    @property
+    def temperature(self) -> torch.Tensor:
+        return torch.exp(self.log_temperature.clamp(-4.0, 4.0))
+
+    def encode_cards(self, ids):
+        """ids (..., C) int64 → (..., C, d) 归一化卡牌嵌入（0 号 = UNK/空槽）。"""
+        return self._norm(self.emb(ids.long()))
+
+    def candidates_with_wait(self, ids):
+        """(..., C) 索引 → (..., C+1, d)：0 号位是 e_wait（WAIT 候选），其余按原顺序。"""
+        cards = self.encode_cards(ids)
+        wait = self._norm(self.wait_token).expand(*cards.shape[:-2], 1, cards.shape[-1])
+        return torch.cat([wait, cards], dim=-2)
+
+    def score(self, query, candidates):
+        """query (..., d)、candidates (..., C, d) → (..., C) 余弦相似度 × τ。"""
+        import torch.nn.functional as F
+
+        return F.cosine_similarity(query.unsqueeze(-2), candidates, dim=-1) * self.temperature
 
 
 class Projector(nn.Module):

@@ -14,7 +14,8 @@ in the M2 changes (the flattened mask is exposed as obs["action_mask"]).
 Structured side channels (encoded by the MLP encoder, not the CNN):
   elixir      -- own exact elixir (explicit interface; using it is optional)
   elixir_rate -- current elixir growth rate in elixir/second
-  deck_seq    -- own deck in cycle order, 8x (card_id, form_bit) flattened
+  hand_ids    -- current hand card pool indices (4, 0 = empty/UNK)
+  deck_ids    -- own deck pool indices (8) for critic deck conditioning
 
 Continuous collection mode: the engine runs in real time and is never
 paused between steps; each step commits the action for the next 5 ticks
@@ -87,7 +88,9 @@ def _load_deck_pool():
         )
         supported = {int(c["card_id"]) for c in sup.get("supported_cards", [])}
         ids &= supported
-        ids -= {i for i in ids if 27000000 <= i < 27000100}  # 冠军卡：建局校验未过，先剔除
+        # 注：27000 段是建筑卡（加农炮/特斯拉等），26000 段内混有冠军卡
+        # （Monk 26000077、Little Prince 26000093）。冠军技能动作
+        # （ACTIVATE_ABILITY）不在当前 2305 路动作空间里，部署本身合法。
     except Exception:
         pass
     return tuple(sorted(ids)) if ids else ()
@@ -448,13 +451,6 @@ class FirstLight(gym.Env):
                             flat[base + y * GRID_W + x] = 1
         return flat
 
-    def _deck_seq(self):
-        seq = np.zeros(16, dtype=np.float32)
-        for index, card_id in enumerate(self._deck0):
-            seq[index * 2] = card_id / 3.0e7        # 顺序即过牌顺序基线
-            seq[index * 2 + 1] = 0.0                # form bit（本组态全 0）
-        return seq
-
     def _decode(self, index):
         index = int(index)
         if index <= WAIT_INDEX or index > 4 * CELLS:
@@ -481,7 +477,7 @@ class FirstLight(gym.Env):
             "is_terminal": np.bool_(terminated),
             "elixir": np.array([elixir], dtype=np.float32),
             "elixir_rate": np.array([self._elixir_rate(obs0.tick)], dtype=np.float32),
-            "deck_seq": self._deck_seq(),
+            "hand_ids": self._hand_ids(native_now),
             "action_mask": self._mask_flat(),
         }
 
@@ -495,7 +491,7 @@ class FirstLight(gym.Env):
                 "image": gym.spaces.Box(0, 255, (height, width, 3), dtype=np.uint8),
                 "elixir": gym.spaces.Box(0, 10, (1,), dtype=np.float32),
                 "elixir_rate": gym.spaces.Box(0, 1, (1,), dtype=np.float32),
-                "deck_seq": gym.spaces.Box(0, 1, (16,), dtype=np.float32),
+                "hand_ids": gym.spaces.Box(0, 300, (4,), dtype=np.int64),
                 "deck_ids": gym.spaces.Box(0, 300, (8,), dtype=np.int64),
                 "action_mask": gym.spaces.Box(0, 1, (1 + 4 * CELLS,), dtype=np.uint8),
             }
@@ -516,6 +512,12 @@ class FirstLight(gym.Env):
             )
             self._battle = None
             return self._reset_inner(restart=True)
+
+    def _hand_ids(self, native_now):
+        """owner-0 当前手牌的卡池索引（空/未知 = 0 号 UNK），供 actor 卡头查嵌入。"""
+        hand = next(p for p in native_now["players"] if p["owner"] == 0)["hand"]
+        ids = [DECK_INDEX.get(c["cardId"], 0) for c in hand]
+        return np.array((ids + [0] * 4)[:4], dtype=np.int64)
 
     def _sample_decks(self, seed):
         """按 deck_mode 采样双方卡组（fixed 模式保持构造时的组态）。"""
@@ -588,6 +590,7 @@ class FirstLight(gym.Env):
                 break
         self._battle.native.set_speed(self._speed)       # 游玩期速度（引擎保持运行）
         self._mask = self._battle.action_mask(0)
+        native_now = self._battle.native.observe()
         image = self._capture()
         obs = {
             "image": image,
@@ -599,7 +602,7 @@ class FirstLight(gym.Env):
                 dtype=np.float32,
             ),
             "elixir_rate": np.array([self._elixir_rate(obs0.tick)], dtype=np.float32),
-            "deck_seq": self._deck_seq(),
+            "hand_ids": self._hand_ids(native_now),
             "deck_ids": np.array([DECK_INDEX[c] for c in self._deck0], dtype=np.int64),
             "action_mask": self._mask_flat(),
         }
@@ -633,7 +636,7 @@ class FirstLight(gym.Env):
                 "image": np.zeros(self._size + (3,), dtype=np.uint8),
                 "elixir": np.zeros(1, dtype=np.float32),
                 "elixir_rate": np.zeros(1, dtype=np.float32),
-                "deck_seq": self._deck_seq(),
+                "hand_ids": self._hand_ids(native_now),
                 "action_mask": self._mask_flat(),
             }
         # 基础设施中止 = 截断（is_last 而非 is_terminal）：世界模型按可
@@ -718,7 +721,7 @@ class FirstLight(gym.Env):
                 dtype=np.float32,
             ),
             "elixir_rate": np.array([self._elixir_rate(obs0.tick)], dtype=np.float32),
-            "deck_seq": self._deck_seq(),
+            "hand_ids": self._hand_ids(native_now),
             "deck_ids": np.array([DECK_INDEX[c] for c in self._deck0], dtype=np.int64),
             "action_mask": self._mask_flat(),
         }
