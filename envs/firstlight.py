@@ -12,13 +12,12 @@ Illegal indices degrade to WAIT; dynamic masking is layered onto the actor
 in the M2 changes (the flattened mask is exposed as obs["action_mask"]).
 
 Structured side channels (encoded by the MLP encoder, not the CNN):
-  elixir      -- own elixir. Source is CR_ELIXIR_SOURCE (default "probe"):
-                 the probe's authoritative value (covers Elixir Collector,
-                 Elixir Golem refunds, and every other event-driven gain);
-                 "ledger" switches back to the rule-integrated ElixirLedger
-                 (deployment-faithful, but blind to event-driven elixir).
-                 The ledger always keeps running as a drift auditor --
-                 probe - ledger is logged per step.
+  elixir      -- own elixir, straight from the probe (authoritative:
+                 covers Elixir Collector, Elixir Golem refunds and every
+                 other event-driven gain). This is a probe-dependent
+                 channel; a deployment-faithful rule ledger was tried and
+                 removed -- it cannot see event-driven elixir (see git
+                 history, ElixirLedger).
   elixir_rate -- current elixir growth rate in elixir/second (rule-based:
                  the probe exposes no rate; collector ticks are absent here)
   hand_ids    -- current hand card pool indices (4, 0 = empty/UNK)
@@ -106,39 +105,6 @@ def _load_deck_pool():
 DECK_POOL = _load_deck_pool()
 DECK_INDEX = {card: i for i, card in enumerate(DECK_POOL)}                 # 对手侧全支持池（122）
 DECK_POOL_OWNED = tuple(sorted(set(DECKS["swarm"]) | set(DECKS["standard"])))
-
-
-class ElixirLedger:
-    """圣水规则账本：锚点值 + ELIXIR_SEGMENTS 阶段积分 - 我方出牌费用。
-
-    零传感器、部署通用，但**看不见事件式产出**（圣水收集器涌出、圣水
-    哥勒姆死亡返还、克隆/镜像复制等），因此 obs 主通道默认是探针真值
-    （CR_ELIXIR_SOURCE=probe，见 _probe_elixir）。账本降级为纯审计器：
-    drift = probe - ledger 每步入 align 日志，drift 非零即存在账本盲区
-    事件（或引擎/管线退化），是免费的管线健康指标。
-    """
-
-    def __init__(self):
-        self.reset(start_tick=0)
-
-    def reset(self, start_tick: int = 0, anchor_value: float | None = None, anchor_tick: int | None = None):
-        # 锚定一次引擎真值后纯规则积分：base = 锚点圣水 - 锚点前已产出
-        from native_runner.battle_env import _elixir_generated_raw
-
-        self.start_tick = 0
-        self.anchor_tick = int(anchor_tick or start_tick)
-        gen = _elixir_generated_raw(0, self.anchor_tick) / 10_000.0
-        self.base = (float(anchor_value) - gen) if anchor_value is not None else 5.0
-        self.spent = 0.0
-
-    def record_play(self, cost: float):
-        self.spent += float(cost)
-
-    def value(self, tick: int) -> float:
-        from native_runner.battle_env import _elixir_generated_raw
-
-        raw = _elixir_generated_raw(0, int(tick)) / 10_000.0
-        return float(np.clip(self.base + raw - self.spent, 0.0, 10.0))
 
 
 class FirstLightInlineEnv:
@@ -267,8 +233,7 @@ class FirstLight(gym.Env):
         self._stream = None
         self._capture_fallbacks = 0
         self._last_obs = None
-        self._ledger = ElixirLedger()
-        self._elixir_drift = 0.0
+        self._last_elixir = 5.0  # 圣水通道缺读数时的回退值（开局标准值）
         self._episodes = 0
         self._battle = None
         self._mask = None
@@ -471,10 +436,7 @@ class FirstLight(gym.Env):
             "speed": self._speed,
             "opp_plays": self._opp_plays,
             "opp_last": self._opp_last,
-            "elixir": round(self._ledger.value(tick), 3),
-            "elixir_drift": round(
-                (float(engine_elixir) if engine_elixir is not None else 0.0)
-                - self._ledger.value(tick), 3),
+            "elixir": round(float(engine_elixir or 0.0), 3),
         })
         with open(self._align_path, "a") as f:
             f.write(line + "\n")
@@ -529,15 +491,14 @@ class FirstLight(gym.Env):
         return float(_elixir_raw_per_tick(int(tick))) * 20.0 / 10000.0
 
     def _probe_elixir(self, player, tick):
-        """圣水主通道：探针真值（CR_ELIXIR_SOURCE=ledger 时退回规则账本）。
+        """圣水通道：探针真值（覆盖收集器涌出等一切事件式产出）。
 
-        账本永远照常积分，供 drift 审计；探针缺读数（理论不发生）时也退回
-        账本，保证 obs 键恒有值。
+        探针缺读数（理论不发生）时退回上一次读数，保证 obs 键恒有值。
         """
         exact = getattr(player, "elixir_exact", None)
-        if os.environ.get("CR_ELIXIR_SOURCE", "probe") == "probe" and exact is not None:
-            return float(np.clip(float(exact), 0.0, 10.0))
-        return float(self._ledger.value(int(tick)))
+        if exact is not None:
+            self._last_elixir = float(np.clip(float(exact), 0.0, 10.0))
+        return self._last_elixir
 
     def _mask_flat(self):
         flat = np.zeros(1 + 4 * CELLS, dtype=np.uint8)
@@ -697,10 +658,6 @@ class FirstLight(gym.Env):
         self._battle.native.set_speed(self._speed)       # 游玩期速度（引擎保持运行）
         self._mask = self._battle.action_mask(0)
         native_now = self._battle.native.observe()
-        # 账本锚定：用新鲜的 elixirRaw（引擎真值），一次性吸收开局差异
-        _el = next(p for p in native_now["players"] if p["owner"] == 0)
-        self._ledger.reset(anchor_value=float(_el.get("elixirRaw", 50_000)) / 10_000.0,
-                           anchor_tick=obs0.tick)
         image = self._capture()
         obs0_player = next(p for p in obs0.players if p.owner == 0)
         obs = {
@@ -780,7 +737,6 @@ class FirstLight(gym.Env):
         if legal:
             rp0 = next(p for p in native_now["players"] if p["owner"] == 0)
             hand_card = next(c for c in rp0["hand"] if c["handIndex"] == slot)
-            play_cost = float(hand_card.get("cost") or 0.0)
             # next_decision_ticks=10：固定 10 tick 决策节奏（2Hz@speed 1.0）——保证对局在
             # time_limit 内到达终局（±1 奖励才存在），并与 4Hz 协议一致
             play = self._action_v1.play(
@@ -795,7 +751,6 @@ class FirstLight(gym.Env):
                 offset = 1 + attempt * 2
                 try:
                     result = self._battle.step_actor(0, with_opp([replace(play, execute_offset_ticks=offset)]))
-                    self._ledger.record_play(play_cost)
                     break
                 except BattleEnvError as error:
                     # 决策死线竞态（偶发）：降级为等待。环境绝不因智能体动作而崩溃。
