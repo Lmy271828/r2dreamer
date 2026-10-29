@@ -653,8 +653,15 @@ class CardActionHead(nn.Module):
     手牌只在出牌后变化）。
     """
 
-    def __init__(self, config, inp_dim):
+    def __init__(self, config, inp_dim, cell_head="categorical"):
         super().__init__()
+        # cell_head: "categorical"（主线，Arm A）| "gaussian"（消融 Arm B，
+        # 未实现——规程与判据见 docs/ablation_hier_action_head.md）
+        if cell_head != "categorical":
+            raise NotImplementedError(
+                f"cell_head={cell_head!r} is a reserved ablation arm; "
+                "see docs/ablation_hier_action_head.md"
+            )
         cell_num = (int(config.shape[0]) - 2) // 4
         unimix = float(getattr(config.dist, "unimix_ratio", 0.0))
         self.cell_num = cell_num
