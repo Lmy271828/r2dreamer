@@ -21,7 +21,7 @@ vm_indexes: [1, 0]       # env0=instance1（原），env1=instance0（克隆）
 vm_names: ['皇室战争模拟器', '皇室战争模拟器-1']
 
 encoder:
-  mlp_keys: '^(elixir|elixir_rate|deck_seq)$'
+  mlp_keys: '^(elixir|elixir_rate)$'
   cnn_keys: 'image'
 decoder:
   mlp_keys: '$^'
