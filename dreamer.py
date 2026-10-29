@@ -535,6 +535,32 @@ class Dreamer(nn.Module):
         entropy = policy.entropy()[:, :-1].unsqueeze(-1)
         losses["policy"] = torch.mean(weight[:, :-1].detach() * -(logpi * adv.detach() + self.act_entropy * entropy))
 
+        # === S5 观察点：动作三桶占比（与 action_entropy 同源同语义） ===
+        # 在想象轨迹的每一步取当前策略采样出的动作（imag_action 已 detach，
+        # 只当"该步策略的类型先验"读），统计三类扁平索引的占比：
+        #
+        #   s_type = (1 / (B*(H-1))) * Σ_{b=1..B} Σ_{t=1..H-1} 1[idx_bt ∈ type]
+        #
+        #   idx_bt = argmax imag_action_bt（one-hot → 扁平索引，0..A-1）
+        #   WAIT   : idx = 0
+        #   PLAY   : 1 <= idx <= A-2   （卡+格）
+        #   ABILITY: idx = A-1 = 2305  （仅结构化头存在该桶；其他环境该位
+        #             无技能语义，因此只在 self._needs_hand_ids 时打点）
+        #
+        # 数学含义：s_type 是边际选择概率 π(a ∈ type | s), s ~ ρ_π 的一致估计，
+        # 其中 ρ_π 是想象 rollout 的状态边际分布（状态覆盖 ≈ replay 分布，
+        # 有界的 imagination-horizon 偏差，与 action_entropy 同一近似族）。
+        # 三桶之和恒为 1；它比熵更敏感：熵是三桶内分布的混合泛函
+        # H(π) ≈ H(类型) + Σ_type s_type·H(π | type)，s_type 位移时熵可以
+        # 几乎不动（例如 WAIT 与 PLAY 内部此消彼长），反之 s_type 能暴露
+        # 策略"学会用技能/学会憋牌"的直接行为变化。
+        if self._needs_hand_ids:
+            A = imag_action.shape[-1]
+            idx = imag_action.argmax(-1)[:, :-1]                     # (B*T, H-1)
+            metrics["action_type_wait"] = torch.mean((idx == 0).to(torch.float32))
+            metrics["action_type_play"] = torch.mean(((idx >= 1) & (idx <= A - 2)).to(torch.float32))
+            metrics["action_type_ability"] = torch.mean((idx == A - 1).to(torch.float32))
+
         imag_value_dist = self.value(imag_feat)
         # (B*T, T_imag, 1)
         tar_padded = torch.cat([ret, 0 * ret[:, -1:]], 1)
