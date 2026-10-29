@@ -503,3 +503,75 @@ class ReturnEMA(nn.Module):
         scale = torch.clip(self.ema_vals[1] - self.ema_vals[0], min=1.0)
         offset = self.ema_vals[0]
         return offset.detach(), scale.detach()
+
+
+class CardQueryActor(nn.Module):
+    """S3 两级动作头：点积卡头（动态候选集）× 条件格头。
+
+    - 卡头：query = Linear(feat → d)，与候选嵌入（e_wait + 手牌 4 卡 +
+      e_ability）做余弦点积 × τ（复用 CardEmbeddingTable），得槽位 logits。
+      候选集随手牌变化：手牌换了，点积对象就换了——固定 2305 维输出头
+      无法表达这一结构。
+    - 格头：MLP([feat, 被选卡嵌入]) → 576 格 logits，按该槽位的
+      placement_mask 掩码；对全部 4 个手牌槽并行计算，分布内按采样槽位
+      选取。
+    - ABILITY 是预留令牌：合法性由掩码第 2305 位（env 侧技能位）决定，
+      未接入前恒非法，分布行为与 WAIT-only 等价。
+
+    mask 约定：沿用 env 的扁平掩码 (1 + 4*CELLS + 1)。bit0=WAIT，
+    bit(1+s*576 + c)=槽 s 格 c，bit2305=技能位。
+    """
+
+    HAND = 4
+    SLOTS = 6  # WAIT + 4 hand + ABILITY
+
+    def __init__(self, config, inp_dim, card_table: CardEmbeddingTable, cell_num: int, unimix_ratio: float):
+        super().__init__()
+        self.card_table = card_table
+        self.cell_num = int(cell_num)
+        self.unimix_ratio = float(unimix_ratio)
+        self.d = card_table.dim
+        self.ability_token = nn.Parameter(torch.zeros(self.d))
+        nn.init.normal_(self.ability_token, std=0.02)
+        self.query = nn.Linear(inp_dim, self.d)
+        self.cell_mlp = MLP(config, inp_dim + self.d)
+        self.cell_last = nn.Linear(self.cell_mlp.out_dim, self.cell_num)
+        self.query.apply(weight_init_)
+        self.cell_last.apply(weight_init_)
+        if float(config.outscale) != 1.0:
+            with torch.no_grad():
+                self.cell_last.weight.mul_(float(config.outscale))
+
+    def forward(self, feat, hand_ids, mask_flat):
+        """feat (B,T,F)、hand_ids (B,T,4)、mask_flat (B,T,1+4C+1) → CardCellDist。"""
+        import torch.nn.functional as F
+
+        query = F.normalize(self.query(feat), dim=-1)                    # (B,T,d)
+        cards = self.card_table.encode_cards(hand_ids)                   # (B,T,4,d)
+        wait = F.normalize(self.card_table.norm(self.card_table.wait_token), dim=-1)
+        ability = F.normalize(self.card_table.norm(self.ability_token), dim=-1)
+        wait = wait.expand(*cards.shape[:-2], 1, self.d)
+        ability = ability.expand(*cards.shape[:-2], 1, self.d)
+        candidates = torch.cat([wait, cards, ability], dim=-2)           # (B,T,6,d)
+
+        slot_logits = self.card_table.score(query, candidates)           # (B,T,6)
+
+        # 槽位合法性自扁平掩码导出（布局 1 WAIT + 4×C 手牌 + 1 技能）：
+        # WAIT 位取 bit0；手牌位 = 该槽任一格合法；技能位 = bit2305
+        B, T = feat.shape[:2]
+        wait_bit = mask_flat[..., :1]                                    # (B,T,1)
+        hand_cells = mask_flat[..., 1:1 + self.HAND * self.cell_num].reshape(B, T, self.HAND, self.cell_num)
+        ability_bit = mask_flat[..., 1 + self.HAND * self.cell_num:]     # (B,T,1)
+        slot_mask = torch.cat([wait_bit, hand_cells.amax(dim=-1), ability_bit], dim=-1)  # (B,T,6)
+
+        cell_in = torch.cat([feat.unsqueeze(-2).expand(B, T, self.HAND, feat.shape[-1]),
+                             cards], dim=-1)                              # (B,T,4,F+d)
+        cell_logits = self.cell_last(self.cell_mlp(cell_in))              # (B,T,4,C)
+        cell_masks = hand_cells                                           # (B,T,4,C)
+        # WAIT/ABILITY 槽无格位语义：给全 1 掩码占位，选中时 cell 由 env 忽略
+        ones = torch.ones(B, T, 1, self.cell_num, device=cell_logits.device, dtype=cell_logits.dtype)
+        zeros = torch.zeros(B, T, 1, self.cell_num, device=cell_logits.device, dtype=cell_logits.dtype)
+        # 槽位顺序对齐卡头候选：[WAIT, 手牌0..3, ABILITY]
+        cell_logits = torch.cat([zeros, cell_logits, zeros], dim=-2)      # (B,T,6,C)
+        cell_masks = torch.cat([ones, cell_masks, ones], dim=-2)          # (B,T,6,C)
+        return dists.CardCellDist(slot_logits, slot_mask, cell_logits, cell_masks, self.unimix_ratio)

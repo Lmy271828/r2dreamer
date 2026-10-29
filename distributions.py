@@ -271,3 +271,76 @@ def kl(logits_left, logits_right):
     logprob_right = torch.log_softmax(logits_right, -1)
     prob = torch.softmax(logits_left, -1)
     return (prob * (logprob_left - logprob_right)).sum(-1)  # (...)
+
+
+class CardCellDist:
+    """S3 两级动作分布：(卡槽位选择) × (格位 | 槽位)。
+
+    槽位候选集随手牌动态变化：0 号位 = WAIT，1..4 = 手牌槽，5 号位 =
+    ABILITY（预留的技能释放令牌，掩码未放开前恒为非法）。格位分布在
+    给定槽位下生成，掩码为该槽位的 placement_mask。
+
+    value 约定：(slot_onehot (..., S), cell_onehot (..., C))。S = 6（WAIT +
+    4 手牌 + ABILITY），C = 576。
+    """
+
+    def __init__(self, slot_logits, slot_masks, cell_logits, cell_masks, unimix_ratio=0.0):
+        # slot_logits/slot_masks (..., S)；cell_logits/cell_masks (..., S, C)
+        self.slot_logits = to_f32(slot_logits).masked_fill(to_f32(slot_masks) <= 0, -1e9)
+        self.cell_logits = to_f32(cell_logits)
+        self.cell_masks = to_f32(cell_masks)
+        self.unimix_ratio = unimix_ratio
+        self.S = self.slot_logits.shape[-1]
+        self.C = self.cell_logits.shape[-1]
+        masked_cell = self.cell_logits.masked_fill(self.cell_masks <= 0, -1e9)
+        self.slot = OneHotDist(self.slot_logits, unimix_ratio=unimix_ratio)
+        # (..., S, C) 每个槽位下的格位 log 概率（unimix 后，逐槽独立归一）
+        self.cell_logprobs = unimix_logits(masked_cell, unimix_ratio)
+        # 与 OneHotDist 的 unimix 保持一致，保证 log_prob/rsample 同一测度
+        self.slot_logprobs = unimix_logits(self.slot_logits, unimix_ratio)
+
+    def _split(self, value):
+        slot_onehot, cell_onehot = value
+        si = slot_onehot.argmax(dim=-1)                       # (...)
+        ci = cell_onehot.argmax(dim=-1)                       # (...)
+        return si, ci
+
+    def _gather_slot_cells(self, si):
+        """(槽位索引 (...)) -> 该槽位的格位 log 概率 (..., C)。"""
+        return self.cell_logprobs.gather(
+            -2, si.unsqueeze(-1).unsqueeze(-1).expand(*si.shape, 1, self.C)
+        ).squeeze(-2)
+
+    def mode(self):
+        slot = self.slot.mode                                  # (..., S)
+        si = slot.argmax(dim=-1)                               # (...)
+        ci = self._gather_slot_cells(si).argmax(dim=-1)        # (...)
+        cell = F.one_hot(ci, self.C).to(slot.dtype)
+        return (slot, cell)
+
+    def rsample(self, sample_shape=(), temperature=1.0):
+        slot = self.slot.rsample(temperature=temperature)      # (..., S) straight-through
+        si = slot.argmax(dim=-1)                               # (...)
+        cell_lp = self._gather_slot_cells(si)                  # (..., C)
+        cell_probs = torch.softmax(cell_lp, dim=-1)
+        ci = torch.multinomial(cell_probs.reshape(-1, cell_probs.shape[-1]), 1).reshape(cell_probs.shape[:-1])
+        cell = F.one_hot(ci, self.C).to(cell_probs.dtype)
+        cell = cell.detach() + (cell_probs - cell_probs.detach())
+        return (slot, cell)
+
+    def sample(self, **kwargs):
+        raise NotImplementedError
+
+    def log_prob(self, value):
+        slot_onehot, cell_onehot = value
+        si, ci = self._split(value)
+        lp_slot = self.slot_logprobs.gather(-1, si.unsqueeze(-1)).squeeze(-1)
+        lp_cell = self._gather_slot_cells(si).gather(-1, ci.unsqueeze(-1)).squeeze(-1)
+        return lp_slot + lp_cell
+
+    def entropy(self):
+        # torch.special.entr(p) = -p*log(p)，p=0 处为 0——非法位（-inf）不会产生 nan
+        h_slot = torch.special.entr(torch.exp(self.slot_logprobs)).sum(-1)               # (...)
+        h_cell = torch.special.entr(torch.exp(self.cell_logprobs)).sum(-1)               # (..., S)
+        slot_probs = torch.exp(self.slot_logprobs)                                       # (..., S)
+        return h_slot + (slot_probs * h_cell).sum(-1)

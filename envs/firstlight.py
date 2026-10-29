@@ -6,10 +6,14 @@ rendered to the MuMu guest surface (rendering must stay ON -- `render off`
 freezes eglSwapBuffers and screenshots would go stale), and every step ends
 with an `adb screencap` of the calibrated arena rect, downsampled to `size`.
 
-Action: Discrete(1 + 4*576). Index 0 is WAIT; index `1 + slot*576 + cell`
+Action: Discrete(1 + 4*576 + 1). Index 0 is WAIT; index `1 + slot*576 + cell`
 (cell = y*18 + x) plays the card currently in `slot` at that grid cell.
-Illegal indices degrade to WAIT; dynamic masking is layered onto the actor
-in the M2 changes (the flattened mask is exposed as obs["action_mask"]).
+Index 2305 (ABILITY_INDEX) activates the deployed ability of the card:
+legal only when the engine reports a ready type-2 activation
+(action_mask.ability_sources), and degrades to WAIT if the entity snapshot
+is stale. Illegal indices degrade to WAIT; dynamic masking is layered onto
+the actor in the M2 changes (the flattened mask is exposed as
+obs["action_mask"]).
 
 Structured side channels (encoded by the MLP encoder, not the CNN):
   elixir      -- own elixir, straight from the probe (authoritative:
@@ -72,6 +76,12 @@ FIRST_PLAYABLE_TICK = 90
 GRID_W, GRID_H = 18, 32
 CELLS = GRID_W * GRID_H
 WAIT_INDEX = 0
+HAND_NUM = 4
+# 技能位（预留接口的扁平编码）：index 2305 = ACTIVATE_ABILITY。
+# 合法性由掩码末位给出（引擎 action_mask.ability_sources 非空），step 时
+# 解析出 (source_entity, ability_id) 提交 type-2 激活（无目标载荷）。
+ABILITY_INDEX = 1 + HAND_NUM * CELLS
+ACTION_DIM = ABILITY_INDEX + 1
 ARENA_CROP = (111, 430, 967, 1620)
 
 
@@ -234,6 +244,7 @@ class FirstLight(gym.Env):
         self._capture_fallbacks = 0
         self._last_obs = None
         self._last_elixir = 5.0  # 圣水通道缺读数时的回退值（开局标准值）
+        self._ability_by_entity = {}  # canonical 实体 -> 就绪技能 id（上一步 obs 快照）
         self._episodes = 0
         self._battle = None
         self._mask = None
@@ -501,10 +512,10 @@ class FirstLight(gym.Env):
         return self._last_elixir
 
     def _mask_flat(self):
-        flat = np.zeros(1 + 4 * CELLS, dtype=np.uint8)
+        flat = np.zeros(ACTION_DIM, dtype=np.uint8)
         flat[0] = 1  # WAIT is always legal
         if self._mask is not None:
-            for slot in range(4):
+            for slot in range(HAND_NUM):
                 if not self._mask.hand_slots[slot]:
                     continue
                 key = str(slot)
@@ -516,11 +527,16 @@ class FirstLight(gym.Env):
                     for x, legal in enumerate(row):
                         if legal:
                             flat[base + y * GRID_W + x] = 1
+            # 技能位：引擎判定存在合法的 type-2 激活候选（READY + 冷却 0 +
+            # 圣水足够），step 时解析具体 (source_entity, ability_id)
+            flat[ABILITY_INDEX] = 1 if len(tuple(self._mask.ability_sources)) > 0 else 0
         return flat
 
     def _decode(self, index):
         index = int(index)
-        if index <= WAIT_INDEX or index > 4 * CELLS:
+        if index == ABILITY_INDEX:
+            return -1, None, None  # 技能位哨兵：槽位 -1
+        if index <= WAIT_INDEX or index > HAND_NUM * CELLS:
             return None, None, None
         offset = index - 1
         slot = offset // CELLS
@@ -530,9 +546,37 @@ class FirstLight(gym.Env):
     def _legal(self, slot, cx, cy):
         if self._mask is None or slot is None:
             return False
+        if slot == -1:  # 技能位
+            return len(tuple(self._mask.ability_sources)) > 0
         if not self._mask.hand_slots[slot] or str(slot) not in self._mask.placement_masks:
             return False
         return bool(self._mask.placement_masks[str(slot)]["row_major"][cy][cx])
+
+    def _resolve_ability(self):
+        """把掩码的 ability_sources（canonical 实体）解析成 (entity, ability_id)。
+
+        依据上一步 obs 合约里的 ability_runtime_states（canonical id 同源）。
+        多个就绪实体取 canonical id 最小者（确定性；更聪明的选择是策略的
+        事——扁平接口下一次只能释放一个）。解析失败返回 None（降级 WAIT）。
+        """
+        source = sorted(set(int(s) for s in self._mask.ability_sources))
+        for entity in source:
+            ability_id = self._ability_by_entity.get(entity)
+            if ability_id is not None:
+                return entity, ability_id
+        return None
+
+    def _track_abilities(self, obs0):
+        """从 obs 合约刷新实体→就绪技能快照（_resolve_ability 的依据）。"""
+        try:
+            player = next(p for p in obs0.players if p.owner == 0)
+            self._ability_by_entity = {
+                int(st.source_entity): str(st.ability_id)
+                for st in getattr(player, "ability_runtime_states", ())
+                if st.source_entity is not None
+            }
+        except Exception:  # noqa: BLE001 -- 快照失败只影响技能位解析，不影响主流程
+            self._ability_by_entity = {}
 
     def _assemble(self, obs0, is_first, done, terminated):
         player = next(p for p in obs0.players if p.owner == 0)
@@ -560,13 +604,13 @@ class FirstLight(gym.Env):
                 "elixir_rate": gym.spaces.Box(0, 1, (1,), dtype=np.float32),
                 "hand_ids": gym.spaces.Box(0, 300, (4,), dtype=np.int64),
                 "deck_ids": gym.spaces.Box(0, 300, (8,), dtype=np.int64),
-                "action_mask": gym.spaces.Box(0, 1, (1 + 4 * CELLS,), dtype=np.uint8),
+                "action_mask": gym.spaces.Box(0, 1, (ACTION_DIM,), dtype=np.uint8),
             }
         )
 
     @property
     def action_space(self):
-        return gym.spaces.Discrete(1 + 4 * CELLS)
+        return gym.spaces.Discrete(ACTION_DIM)
 
     def reset(self):
         """开局；基础设施故障时强制重启引擎并重试一次（捕获死亡也算）。"""
@@ -671,6 +715,7 @@ class FirstLight(gym.Env):
             "deck_ids": np.array([DECK_INDEX[c] for c in self._deck0], dtype=np.int64),
             "action_mask": self._mask_flat(),
         }
+        self._track_abilities(obs0)
         self._align_log_tick(obs0.tick, engine_elixir=float(next(p for p in obs0.players if p.owner == 0).elixir_exact or 0.0))
         self._last_obs = obs
         return obs
@@ -735,14 +780,27 @@ class FirstLight(gym.Env):
             return d
 
         if legal:
-            rp0 = next(p for p in native_now["players"] if p["owner"] == 0)
-            hand_card = next(c for c in rp0["hand"] if c["handIndex"] == slot)
-            # next_decision_ticks=10：固定 10 tick 决策节奏（2Hz@speed 1.0）——保证对局在
-            # time_limit 内到达终局（±1 奖励才存在），并与 4Hz 协议一致
-            play = self._action_v1.play(
-                owner=0, hand_slot=slot, grid=(cx, cy), card_id=hand_card["cardId"],
-                next_decision_ticks=10,
-            )
+            if slot == -1:
+                # 技能位：解析 (source_entity, ability_id) 提交 type-2 激活
+                resolved = self._resolve_ability()
+                if resolved is None:
+                    # 快照过期等极端情形：降级 WAIT（仍走同一条提交通道）
+                    play = self._action_v1.wait(0, ticks=10, execute_offset_ticks=3)
+                else:
+                    entity, ability_id = resolved
+                    play = self._action_v1(
+                        owner=0, kind="activate_ability", source_entity=entity,
+                        ability_id=ability_id, next_decision_ticks=10,
+                    )
+            else:
+                rp0 = next(p for p in native_now["players"] if p["owner"] == 0)
+                hand_card = next(c for c in rp0["hand"] if c["handIndex"] == slot)
+                # next_decision_ticks=10：固定 10 tick 决策节奏（2Hz@speed 1.0）——保证对局在
+                # time_limit 内到达终局（±1 奖励才存在），并与 4Hz 协议一致
+                play = self._action_v1.play(
+                    owner=0, hand_slot=slot, grid=(cx, cy), card_id=hand_card["cardId"],
+                    next_decision_ticks=10,
+                )
             from dataclasses import replace
 
             last_error = None
@@ -767,6 +825,7 @@ class FirstLight(gym.Env):
                 0, with_opp([self._action_v1.wait(0, ticks=10, execute_offset_ticks=3)])
             )
 
+        self._track_abilities(obs0)
         if terminated or truncated:
             # 对局终局：引擎的回放播放器已停止 stepping，任何后续提交都会失败。
             # 自动重开下一局（ParallelEnv 惰性重置语义），终局奖励已在本步交付。
