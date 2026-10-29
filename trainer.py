@@ -1,3 +1,4 @@
+import copy
 import threading
 import time
 
@@ -109,6 +110,20 @@ class OnlineTrainer:
         ``.to()`` is a no-op when the data is already on the target device.
         """
         envs = self.train_envs
+        # M5 自博弈（P3 定案）：对手 = 主策略的周期性冻结快照；热身期前
+        # act1=None（env 回退随机脚本），warmup 后 deepcopy 快照接管，
+        # 每 refresh_episodes 局用主策略权重刷新一次。
+        selfplay = getattr(envs, "selfplay", False)
+        self._opp_agent = None
+        self._opp_state = None
+        self._opp_episodes = 0
+        self._opp_refresh_at = None
+        if selfplay:
+            print(
+                f"M5: selfplay enabled (warmup={getattr(envs, 'selfplay_warmup', 40)} episodes, "
+                f"refresh={getattr(envs, 'selfplay_refresh', 30)} episodes)",
+                flush=True,
+            )
         video_cache = []
         step = self.replay_buffer.count() * self._action_repeat
         # (B,)
@@ -200,13 +215,38 @@ class OnlineTrainer:
             # on GPU).  The .to() calls below are no-ops when the data is
             # already on agent.device.
             # (B, A), (B,)
+            act1 = None
+            if selfplay:
+                warmup = getattr(envs, "selfplay_warmup", 40)
+                refresh = getattr(envs, "selfplay_refresh", 30)
+                if self._opp_agent is None and self._opp_episodes >= warmup:
+                    self._opp_agent = copy.deepcopy(agent)
+                    self._opp_agent.eval()
+                    self._opp_state = self._opp_agent.get_initial_state(envs.env_num)
+                    self._opp_refresh_at = self._opp_episodes + refresh
+                    print(f"M5: selfplay opponent activated after {self._opp_episodes} episodes", flush=True)
+                elif self._opp_agent is not None and self._opp_episodes >= self._opp_refresh_at:
+                    self._opp_agent.load_state_dict(agent.state_dict())
+                    self._opp_refresh_at = self._opp_episodes + refresh
+                    print(f"M5: opponent snapshot refreshed at {self._opp_episodes} episodes", flush=True)
+                if self._opp_agent is not None:
+                    obs1 = envs.pop_obs1()
+                    if obs1 is not None:
+                        obs1 = obs1.to(agent.device, non_blocking=True)
+                        with torch.no_grad():
+                            a1, self._opp_state = self._opp_agent.act(obs1, self._opp_state, eval=True)
+                        act1 = a1
+                else:
+                    envs.pop_obs1()  # 热身期丢弃，避免陈旧观测跨期
             _t = time.perf_counter()
-            trans, step_done = envs.step(act.detach(), done)
+            trans, step_done = envs.step(act.detach(), done, action1=act1)
             phase_ms["envs_step"].append((time.perf_counter() - _t) * 1000)
             # dict of (B, 1, *)
             trans = trans.to(agent.device, non_blocking=True)
             # (B,)
             done = step_done.to(agent.device)
+            if selfplay:
+                self._opp_episodes += int(done.sum())
 
             # Policy inference on GPU.
             # "agent_state" is reset by the agent based on the "is_first" flag in trans.

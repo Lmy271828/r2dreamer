@@ -21,6 +21,10 @@ def make_envs(config):
             return make_env(config, idx)
 
         env = FirstLightInlineEnv(firstlight_constructor, device=config.device, env_num=env_num)
+        # M5 自博弈参数挂到 envs 对象上，trainer 读取（eval 侧不受影响）
+        env.selfplay = str(config.get("opp_policy", "afk")) == "selfplay"
+        env.selfplay_warmup = int(config.get("selfplay_warmup", 40))
+        env.selfplay_refresh = int(config.get("selfplay_refresh", 30))
         return env, None, env.observation_space, env.action_space
 
     def env_constructor(idx):

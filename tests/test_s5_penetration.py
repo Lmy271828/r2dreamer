@@ -63,7 +63,7 @@ def test_flat_roundtrip():
         (torch.zeros(B, T, 6).index_fill_(-1, torch.tensor([0]), 1.0),
          torch.zeros(B, T, CELLS).index_fill_(-1, torch.tensor([0]), 1.0))), atol=1e-5)
     assert torch.isfinite(dist.entropy()).all()
-    assert torch.isfinite(dist.mode()).all()
+    assert torch.isfinite(dist.mode).all()
     print("PASS: CardFlatDist roundtrip (hand/ability/wait) + log_prob parity")
 
 

@@ -627,6 +627,7 @@ class CardFlatDist:
 
         return F.one_hot(self._idx_from(si, ci), 1 + 4 * self.cell_num + 1).to(slot.dtype)
 
+    @property
     def mode(self):
         slot, cell = self.inner.mode()
         si, ci = slot.argmax(dim=-1), cell.argmax(dim=-1)

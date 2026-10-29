@@ -147,27 +147,33 @@ class FirstLightInlineEnv:
         self.action_space = self._envs[0].action_space
         self.env_num = env_num
         self._needs_reset = [True] * env_num
+        self._last_obs1 = [None] * env_num
 
     # -- per-env worker (runs in the pool thread) -------------------------
 
-    def _step_one(self, index, onehot, done_value):
+    def _step_one(self, index, onehot, onehot1, done_value):
         env = self._envs[index]
         if done_value or self._needs_reset[index]:
             obs = env.reset()
             self._needs_reset[index] = False
             trans = dict(obs)
             trans["reward"] = np.float32(0.0)
+            self._last_obs1[index] = getattr(env, "_last_obs1", None)
             return trans, False
-        obs, reward, done_flag, info = env.step(onehot)
+        obs, reward, done_flag, info = env.step(onehot, action1=onehot1)
         # 终局/截断/基础设施中止后，下一步必须重置该 env
         self._needs_reset[index] = bool(done_flag)
         trans = dict(obs)
         trans["reward"] = np.float32(reward)
+        self._last_obs1[index] = getattr(env, "_last_obs1", None)
         return trans, bool(done_flag)
 
-    def step(self, action, done):
+    def step(self, action, done, action1=None):
         torch = self._torch
         act = action.detach().reshape(self.env_num, -1).cpu()
+        act1 = None
+        if action1 is not None:
+            act1 = action1.detach().reshape(self.env_num, -1).cpu()
         if hasattr(done, "flatten"):
             done_flags = [bool(v) for v in done.flatten().cpu().tolist()]
         else:
@@ -178,7 +184,12 @@ class FirstLightInlineEnv:
             index = int(torch.argmax(act[i]).item())
             onehot = np.zeros(self.action_space.shape[0], dtype=np.float32)
             onehot[index] = 1.0
-            futures.append(self._pool.submit(self._step_one, i, onehot, done_flags[i]))
+            onehot1 = None
+            if act1 is not None:
+                index1 = int(torch.argmax(act1[i]).item())
+                onehot1 = np.zeros(self.action_space.shape[0], dtype=np.float32)
+                onehot1[index1] = 1.0
+            futures.append(self._pool.submit(self._step_one, i, onehot, onehot1, done_flags[i]))
         results = [f.result() for f in futures]
 
         keys = results[0][0].keys()
@@ -195,6 +206,24 @@ class FirstLightInlineEnv:
 
     def reset(self):
         self._needs_reset = [True] * self.env_num
+        self._last_obs1 = [None] * self.env_num
+
+    def pop_obs1(self):
+        """M5：取走本步的 owner-1 视图观测（TensorDict (B,1,*)）；缺任一即 None。"""
+        torch = self._torch
+        if not hasattr(self, "_last_obs1") or any(o is None for o in self._last_obs1):
+            return None
+        keys = self._last_obs1[0].keys()
+        stacked = {
+            k: torch.as_tensor(np.stack([o[k] for o in self._last_obs1]), device="cpu")
+            for k in keys
+        }
+        td = self._TensorDict(stacked, batch_size=(self.env_num,), device="cpu")
+        for key in td.keys(include_nested=True):
+            if td[key].ndim == 1:
+                td[key] = td[key].unsqueeze(-1)
+        self._last_obs1 = [None] * self.env_num  # 取走即清
+        return td
 
 
 class FirstLight(gym.Env):
@@ -245,6 +274,9 @@ class FirstLight(gym.Env):
         self._last_obs = None
         self._last_elixir = 5.0  # 圣水通道缺读数时的回退值（开局标准值）
         self._ability_by_entity = {}  # canonical 实体 -> 就绪技能 id（上一步 obs 快照）
+        self._ability_by_entity_1 = {}  # owner-1 同上（自博弈对手技能解析）
+        self._mask1 = None  # owner-1 掩码（自博弈）
+        self._last_obs1 = None  # owner-1 视图观测（trainer 经 pop_obs1 取用）
         self._episodes = 0
         self._battle = None
         self._mask = None
@@ -511,17 +543,19 @@ class FirstLight(gym.Env):
             self._last_elixir = float(np.clip(float(exact), 0.0, 10.0))
         return self._last_elixir
 
-    def _mask_flat(self):
+    def _mask_flat(self, mask=None):
+        """扁平动作掩码；mask 缺省用 owner-0 的，自博弈对手传 owner-1 的。"""
+        mask = self._mask if mask is None else mask
         flat = np.zeros(ACTION_DIM, dtype=np.uint8)
         flat[0] = 1  # WAIT is always legal
-        if self._mask is not None:
+        if mask is not None:
             for slot in range(HAND_NUM):
-                if not self._mask.hand_slots[slot]:
+                if not mask.hand_slots[slot]:
                     continue
                 key = str(slot)
-                if key not in self._mask.placement_masks:
+                if key not in mask.placement_masks:
                     continue  # e.g. card outside the semantic subset
-                rows = self._mask.placement_masks[key]["row_major"]
+                rows = mask.placement_masks[key]["row_major"]
                 base = 1 + slot * CELLS
                 for y, row in enumerate(rows):
                     for x, legal in enumerate(row):
@@ -529,7 +563,7 @@ class FirstLight(gym.Env):
                             flat[base + y * GRID_W + x] = 1
             # 技能位：引擎判定存在合法的 type-2 激活候选（READY + 冷却 0 +
             # 圣水足够），step 时解析具体 (source_entity, ability_id)
-            flat[ABILITY_INDEX] = 1 if len(tuple(self._mask.ability_sources)) > 0 else 0
+            flat[ABILITY_INDEX] = 1 if len(tuple(mask.ability_sources)) > 0 else 0
         return flat
 
     def _decode(self, index):
@@ -543,14 +577,59 @@ class FirstLight(gym.Env):
         cell = offset % CELLS
         return slot, cell % GRID_W, cell // GRID_W
 
-    def _legal(self, slot, cx, cy):
-        if self._mask is None or slot is None:
+    def _legal(self, slot, cx, cy, mask=None):
+        mask = self._mask if mask is None else mask
+        if mask is None or slot is None:
             return False
         if slot == -1:  # 技能位
-            return len(tuple(self._mask.ability_sources)) > 0
-        if not self._mask.hand_slots[slot] or str(slot) not in self._mask.placement_masks:
+            return len(tuple(mask.ability_sources)) > 0
+        if not mask.hand_slots[slot] or str(slot) not in mask.placement_masks:
             return False
-        return bool(self._mask.placement_masks[str(slot)]["row_major"][cy][cx])
+        return bool(mask.placement_masks[str(slot)]["row_major"][cy][cx])
+
+    def _selfplay_action(self, action1, native_now):
+        """owner-1 动作：trainer 传来的扁平索引 → 引擎动作；None = 脚本热身。
+
+        自博弈对手机制层使用探针特权（手牌/掩码读数）——对手是环境的
+        一部分，见 purity_ladder.md P3；学习方的输入不含任何特权。
+        """
+        if action1 is None:
+            return self._scripted_action(native_now)  # 热身期：随机脚本
+        mask1 = self._battle.action_mask(1)
+        if getattr(mask1, "hand_slots", None) is None:
+            self._opp_last = "not_ready_skip"
+            return None  # 决策窗未就绪：不提交，死线自然过期
+        slot, cx, cy = self._decode(action1)
+        if not self._legal(slot, cx, cy, mask1):
+            self._opp_last = "selfplay_illegal"
+            return self._action_v1.wait(1, ticks=10, execute_offset_ticks=3)
+        if slot == -1:
+            entity, ability_id = self._resolve_ability_owner(1, mask1)
+            if entity is None:
+                return self._action_v1.wait(1, ticks=10, execute_offset_ticks=3)
+            self._opp_last = f"ability:{ability_id[:24]}"
+            return self._action_v1(
+                owner=1, kind="activate_ability", source_entity=entity,
+                ability_id=ability_id, next_decision_ticks=10,
+            )
+        rp1 = next(p for p in native_now["players"] if p["owner"] == 1)
+        hand_card = next((c for c in rp1["hand"] if c["handIndex"] == slot), None)
+        if hand_card is None:
+            return self._action_v1.wait(1, ticks=10, execute_offset_ticks=3)
+        self._opp_plays += 1
+        self._opp_last = f"selfplay:{slot}"
+        return self._action_v1.play(
+            owner=1, hand_slot=slot, grid=(cx, cy), card_id=hand_card["cardId"],
+            next_decision_ticks=10,
+        )
+
+    def _resolve_ability_owner(self, owner, mask):
+        table = self._ability_by_entity if owner == 0 else self._ability_by_entity_1
+        for entity in sorted(set(int(s) for s in mask.ability_sources)):
+            ability_id = table.get(entity)
+            if ability_id is not None:
+                return entity, ability_id
+        return None, None
 
     def _resolve_ability(self):
         """把掩码的 ability_sources（canonical 实体）解析成 (entity, ability_id)。
@@ -568,15 +647,20 @@ class FirstLight(gym.Env):
 
     def _track_abilities(self, obs0):
         """从 obs 合约刷新实体→就绪技能快照（_resolve_ability 的依据）。"""
+        self._track_abilities_owner(obs0, 0)
+
+    def _track_abilities_owner(self, obs0, owner):
         try:
-            player = next(p for p in obs0.players if p.owner == 0)
-            self._ability_by_entity = {
+            player = next(p for p in obs0.players if p.owner == owner)
+            table = self._ability_by_entity if owner == 0 else self._ability_by_entity_1
+            table.clear()
+            table.update({
                 int(st.source_entity): str(st.ability_id)
                 for st in getattr(player, "ability_runtime_states", ())
                 if st.source_entity is not None
-            }
+            })
         except Exception:  # noqa: BLE001 -- 快照失败只影响技能位解析，不影响主流程
-            self._ability_by_entity = {}
+            (self._ability_by_entity if owner == 0 else self._ability_by_entity_1).clear()
 
     def _assemble(self, obs0, is_first, done, terminated):
         player = next(p for p in obs0.players if p.owner == 0)
@@ -627,6 +711,11 @@ class FirstLight(gym.Env):
     def _hand_ids(self, native_now):
         """owner-0 当前手牌的卡池索引（空/未知 = 0 号 UNK），供 actor 卡头查嵌入。"""
         hand = next(p for p in native_now["players"] if p["owner"] == 0)["hand"]
+        ids = [DECK_INDEX.get(c["cardId"], 0) for c in hand]
+        return np.array((ids + [0] * 4)[:4], dtype=np.int64)
+
+    def _hand_ids_owner(self, native_now, owner):
+        hand = next(p for p in native_now["players"] if p["owner"] == owner)["hand"]
         ids = [DECK_INDEX.get(c["cardId"], 0) for c in hand]
         return np.array((ids + [0] * 4)[:4], dtype=np.int64)
 
@@ -716,19 +805,37 @@ class FirstLight(gym.Env):
             "action_mask": self._mask_flat(),
         }
         self._track_abilities(obs0)
+        if self._opp_policy == "selfplay":
+            self._mask1 = self._battle.action_mask(1)
+            self._track_abilities_owner(obs0, 1)
+            p1c = next(p for p in obs0.players if p.owner == 1)
+            self._last_obs1 = {
+                "image": image,
+                "is_first": np.bool_(True),
+                "is_last": np.bool_(False),
+                "is_terminal": np.bool_(False),
+                "elixir": np.array([float(np.clip(float(p1c.elixir_exact or 0.0), 0.0, 10.0))], dtype=np.float32),
+                "elixir_rate": np.array([self._elixir_rate(obs0.tick)], dtype=np.float32),
+                "hand_ids": self._hand_ids_owner(native_now, 1),
+                "deck_ids": np.array([DECK_INDEX[c] for c in self._deck1], dtype=np.int64),
+                "action_mask": self._mask_flat(self._mask1),
+            }
         self._align_log_tick(obs0.tick, engine_elixir=float(next(p for p in obs0.players if p.owner == 0).elixir_exact or 0.0))
         self._last_obs = obs
         return obs
 
-    def step(self, action):
+    def step(self, action, action1=None):
         """连续采集模式 step，带基础设施自愈。
+
+        action1：owner-1 的扁平动作索引（M5 自博弈；None = 按opp_policy
+        回退脚本）。结束后 self._last_obs1 持有 owner-1 视图观测。
 
         guest 侧游戏进程可能在长会话中崩溃/卡死（实测 ~24 分钟一例）：
         传输层一旦失败就重启引擎并以截断语义结束本局——环境绝不因引擎
         故障带崩训练，损失是丢弃当前 episode。
         """
         try:
-            return self._step_inner(action)
+            return self._step_inner(action, action1=action1)
         except (RunnerError, BattleEnvError, TimeoutError) as error:
             print(
                 f"FirstLight: engine failure ({str(error)[:120]}); "
@@ -736,6 +843,7 @@ class FirstLight(gym.Env):
                 flush=True,
             )
             self._battle = None
+            self._last_obs1 = None
             return self._abort_episode_obs()
 
     def _abort_episode_obs(self):
@@ -755,7 +863,7 @@ class FirstLight(gym.Env):
         obs["is_terminal"] = np.bool_(False)
         return obs, np.float32(0.0), True, {"tick": -1}
 
-    def _step_inner(self, action):
+    def _step_inner(self, action, action1=None):
         """连续采集模式：引擎常跑不暂停，step 提交动作并推进一个决策周期。
 
         帧与动作的时序关系：返回的观测是动作执行后的战场（s_{t+1}），
@@ -771,7 +879,12 @@ class FirstLight(gym.Env):
         # 一次 observe 服务本步所有手牌查询（player-0 card_id + 脚本对手），
         # 压缩提交关键路径的探针往返
         native_now = self._battle.native.observe()
-        opp = self._scripted_action(native_now) if self._opp_policy == "random" else None
+        if self._opp_policy == "random":
+            opp = self._scripted_action(native_now)
+        elif self._opp_policy == "selfplay":
+            opp = self._selfplay_action(action1, native_now)
+        else:
+            opp = None
 
         def with_opp(a0_list):
             d = {0: a0_list}
@@ -831,6 +944,7 @@ class FirstLight(gym.Env):
             # 自动重开下一局（ParallelEnv 惰性重置语义），终局奖励已在本步交付。
             self._needs_reset = True
         self._mask = self._battle.action_mask(0)
+        self._mask1 = self._battle.action_mask(1) if self._opp_policy == "selfplay" else None
         reward = np.float32(reward)
         done = bool(terminated)
         image = self._capture()
@@ -846,6 +960,21 @@ class FirstLight(gym.Env):
             "deck_ids": np.array([DECK_INDEX[c] for c in self._deck0], dtype=np.int64),
             "action_mask": self._mask_flat(),
         }
+        if self._mask1 is not None:
+            self._track_abilities_owner(obs0, 1)
+            p1c = next(p for p in obs0.players if p.owner == 1)
+            obs["is_first"] = obs["is_first"]  # noqa: FURB122 -- keep dtype
+            self._last_obs1 = {
+                "image": image,
+                "is_first": np.bool_(False),
+                "is_last": np.bool_(done),
+                "is_terminal": np.bool_(terminated),
+                "elixir": np.array([float(np.clip(float(p1c.elixir_exact or 0.0), 0.0, 10.0))], dtype=np.float32),
+                "elixir_rate": np.array([self._elixir_rate(obs0.tick)], dtype=np.float32),
+                "hand_ids": self._hand_ids_owner(native_now, 1),
+                "deck_ids": np.array([DECK_INDEX[c] for c in self._deck1], dtype=np.int64),
+                "action_mask": self._mask_flat(self._mask1),
+            }
         self._align_log_tick(obs0.tick, engine_elixir=float(next(p for p in obs0.players if p.owner == 0).elixir_exact or 0.0))
         self._last_obs = obs
         if done and self._episodes % 20 == 0:  # 每 20 局采样一次终局诊断
