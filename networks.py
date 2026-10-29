@@ -543,35 +543,123 @@ class CardQueryActor(nn.Module):
                 self.cell_last.weight.mul_(float(config.outscale))
 
     def forward(self, feat, hand_ids, mask_flat):
-        """feat (B,T,F)、hand_ids (B,T,4)、mask_flat (B,T,1+4C+1) → CardCellDist。"""
+        """feat (..., F)、hand_ids (..., 4)、mask_flat (..., 1+4C+1) → CardCellDist。
+
+        前导维任意（act 传 (B,1,*)，想象 rollout 传 (B*T, *)）。
+        """
         import torch.nn.functional as F
 
-        query = F.normalize(self.query(feat), dim=-1)                    # (B,T,d)
-        cards = self.card_table.encode_cards(hand_ids)                   # (B,T,4,d)
+        lead = feat.shape[:-1]
+        query = F.normalize(self.query(feat), dim=-1)                    # (...,d)
+        cards = self.card_table.encode_cards(hand_ids)                   # (...,4,d)
         wait = F.normalize(self.card_table.norm(self.card_table.wait_token), dim=-1)
         ability = F.normalize(self.card_table.norm(self.ability_token), dim=-1)
         wait = wait.expand(*cards.shape[:-2], 1, self.d)
         ability = ability.expand(*cards.shape[:-2], 1, self.d)
-        candidates = torch.cat([wait, cards, ability], dim=-2)           # (B,T,6,d)
+        candidates = torch.cat([wait, cards, ability], dim=-2)           # (...,6,d)
 
-        slot_logits = self.card_table.score(query, candidates)           # (B,T,6)
+        slot_logits = self.card_table.score(query, candidates)           # (...,6)
 
         # 槽位合法性自扁平掩码导出（布局 1 WAIT + 4×C 手牌 + 1 技能）：
         # WAIT 位取 bit0；手牌位 = 该槽任一格合法；技能位 = bit2305
-        B, T = feat.shape[:2]
-        wait_bit = mask_flat[..., :1]                                    # (B,T,1)
-        hand_cells = mask_flat[..., 1:1 + self.HAND * self.cell_num].reshape(B, T, self.HAND, self.cell_num)
-        ability_bit = mask_flat[..., 1 + self.HAND * self.cell_num:]     # (B,T,1)
-        slot_mask = torch.cat([wait_bit, hand_cells.amax(dim=-1), ability_bit], dim=-1)  # (B,T,6)
+        wait_bit = mask_flat[..., :1]                                    # (...,1)
+        hand_cells = mask_flat[..., 1:1 + self.HAND * self.cell_num].reshape(
+            *lead, self.HAND, self.cell_num)
+        ability_bit = mask_flat[..., 1 + self.HAND * self.cell_num:]     # (...,1)
+        slot_mask = torch.cat([wait_bit, hand_cells.amax(dim=-1), ability_bit], dim=-1)  # (...,6)
 
-        cell_in = torch.cat([feat.unsqueeze(-2).expand(B, T, self.HAND, feat.shape[-1]),
-                             cards], dim=-1)                              # (B,T,4,F+d)
-        cell_logits = self.cell_last(self.cell_mlp(cell_in))              # (B,T,4,C)
-        cell_masks = hand_cells                                           # (B,T,4,C)
+        cell_in = torch.cat([feat.unsqueeze(-2).expand(*lead, self.HAND, feat.shape[-1]),
+                             cards], dim=-1)                              # (...,4,F+d)
+        cell_logits = self.cell_last(self.cell_mlp(cell_in))              # (...,4,C)
+        cell_masks = hand_cells                                           # (...,4,C)
         # WAIT/ABILITY 槽无格位语义：给全 1 掩码占位，选中时 cell 由 env 忽略
-        ones = torch.ones(B, T, 1, self.cell_num, device=cell_logits.device, dtype=cell_logits.dtype)
-        zeros = torch.zeros(B, T, 1, self.cell_num, device=cell_logits.device, dtype=cell_logits.dtype)
+        ones = torch.ones(*lead, 1, self.cell_num, device=cell_logits.device, dtype=cell_logits.dtype)
+        zeros = torch.zeros(*lead, 1, self.cell_num, device=cell_logits.device, dtype=cell_logits.dtype)
         # 槽位顺序对齐卡头候选：[WAIT, 手牌0..3, ABILITY]
-        cell_logits = torch.cat([zeros, cell_logits, zeros], dim=-2)      # (B,T,6,C)
-        cell_masks = torch.cat([ones, cell_masks, ones], dim=-2)          # (B,T,6,C)
+        cell_logits = torch.cat([zeros, cell_logits, zeros], dim=-2)      # (...,6,C)
+        cell_masks = torch.cat([ones, cell_masks, ones], dim=-2)          # (...,6,C)
         return dists.CardCellDist(slot_logits, slot_mask, cell_logits, cell_masks, self.unimix_ratio)
+
+
+def default_card_table(dim: int = 64) -> CardEmbeddingTable:
+    """M4 卡表：词表 = DECK_INDEX 池（+0 号 UNK/WAIT 位），d=64。"""
+    return CardEmbeddingTable(len(_deck_pool_ids()) + 1, dim)
+
+
+class CardFlatDist:
+    """CardCellDist → 扁平 2306 维接口适配器。
+
+    环境交换、RSSM prev_action、buffer 存储都沿用扁平 one-hot；
+    log_prob/entropy 在内部解包回 (槽位, 格位) 结构计算。槽位候选：
+    0=WAIT，1..4=手牌，5=ABILITY（冠军/英雄技能，合法性=扁平掩码 bit2305）。
+    """
+
+    def __init__(self, inner: "dists.CardCellDist", cell_num: int):
+        self.inner = inner
+        self.cell_num = cell_num
+
+    def _idx_from(self, si, ci):
+        """(槽位 0..5, 格位) -> 扁平索引。"""
+        idx = torch.zeros_like(si)
+        idx = torch.where(si == 0, torch.zeros_like(si), idx)
+        hand = (si >= 1) & (si <= 4)
+        idx = torch.where(hand, 1 + (si - 1) * self.cell_num + ci, idx)
+        idx = torch.where(si == 5, torch.full_like(si, 1 + 4 * self.cell_num), idx)
+        return idx
+
+    def _split(self, flat):
+        """扁平 one-hot (..., A) -> (slot_onehot (...,6), cell_onehot (...,576))。"""
+        import torch.nn.functional as F
+
+        idx = flat.argmax(dim=-1)
+        ability = idx == 1 + 4 * self.cell_num
+        hand = (idx >= 1) & (idx <= 4 * self.cell_num)
+        si = torch.where(ability, torch.full_like(idx, 5), torch.where(hand, 1 + (idx - 1) // self.cell_num, torch.zeros_like(idx)))
+        ci = torch.where(hand, (idx - 1) % self.cell_num, torch.zeros_like(idx))
+        slot = F.one_hot(si, 6).to(flat.dtype)
+        cell = F.one_hot(ci, self.cell_num).to(flat.dtype)
+        return (slot, cell)
+
+    def rsample(self, sample_shape=(), temperature=1.0):
+        slot, cell = self.inner.rsample(temperature=temperature)
+        si, ci = slot.argmax(dim=-1), cell.argmax(dim=-1)
+        import torch.nn.functional as F
+
+        return F.one_hot(self._idx_from(si, ci), 1 + 4 * self.cell_num + 1).to(slot.dtype)
+
+    def mode(self):
+        slot, cell = self.inner.mode()
+        si, ci = slot.argmax(dim=-1), cell.argmax(dim=-1)
+        import torch.nn.functional as F
+
+        return F.one_hot(self._idx_from(si, ci), 1 + 4 * self.cell_num + 1).to(slot.dtype)
+
+    def sample(self, **kwargs):
+        raise NotImplementedError
+
+    def log_prob(self, flat):
+        return self.inner.log_prob(self._split(flat))
+
+    def entropy(self):
+        return self.inner.entropy()
+
+
+class CardActionHead(nn.Module):
+    """结构化 actor 头，对 dreamer 暴露与 MLPHead 相同的扁平接口。
+
+    forward(feat (B,T,F), mask (B,T,A), hand_ids (B,T,4)) → CardFlatDist。
+    S5 三处穿透（act / _imagine / policy.log_prob）只多传 hand_ids，其余
+    代码不变：想象 rollout 里手牌沿时间轴前向持有（与掩码同一近似——
+    手牌只在出牌后变化）。
+    """
+
+    def __init__(self, config, inp_dim):
+        super().__init__()
+        cell_num = (int(config.shape[0]) - 2) // 4
+        unimix = float(getattr(config.dist, "unimix_ratio", 0.0))
+        self.cell_num = cell_num
+        self.inner = CardQueryActor(config, inp_dim, default_card_table(), cell_num, unimix)
+
+    def forward(self, x, mask=None, hand_ids=None):
+        assert hand_ids is not None, "CardActionHead requires obs['hand_ids']"
+        return CardFlatDist(self.inner(x, hand_ids, mask), self.cell_num)

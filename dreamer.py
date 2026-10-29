@@ -45,7 +45,7 @@ class Dreamer(nn.Module):
         self.reward = networks.MLPHead(config.reward, self.rssm.feat_size)
         self.cont = networks.MLPHead(config.cont, self.rssm.feat_size)
 
-        config.actor.shape = (act_space.n,) if hasattr(act_space, "n") else tuple(map(int, act_space.shape))
+        config.actor.shape = (int(act_space.n),) if hasattr(act_space, "n") else tuple(int(s) for s in act_space.shape)
         self.act_discrete = False
         if hasattr(act_space, "multi_discrete"):
             config.actor.dist = config.actor.dist.multi_disc
@@ -57,7 +57,15 @@ class Dreamer(nn.Module):
             config.actor.dist = config.actor.dist.cont
 
         # Actor-critic components
-        self.actor = networks.MLPHead(config.actor, self.rssm.feat_size)
+        # S5：FirstLight env（obs 含 hand_ids）→ 结构化卡头（点积卡 × 条件格，
+        # 含冠军/英雄技能位）；扁平 2306 维接口由 CardFlatDist 适配，三处
+        # 穿透（act / _imagine / policy.log_prob）只多传 hand_ids。
+        if "hand_ids" in getattr(obs_space, "spaces", {}):
+            self.actor = networks.CardActionHead(config.actor, self.rssm.feat_size)
+            self._needs_hand_ids = True
+        else:
+            self.actor = networks.MLPHead(config.actor, self.rssm.feat_size)
+            self._needs_hand_ids = False
         self.value = networks.MLPHead(config.critic, self.rssm.feat_size)
         self.slow_target_update = int(config.slow_target_update)
         self.slow_target_fraction = float(config.slow_target_fraction)
@@ -270,11 +278,15 @@ class Dreamer(nn.Module):
         stoch, deter, _ = self._frozen_rssm.obs_step(prev_stoch, prev_deter, prev_action, embed, obs["is_first"])
         # (B, F)
         feat = self._frozen_rssm.get_feat(stoch, deter)
-        # M2: 观测自带的合法性掩码（B, 2305），非法 logit 在头内被淹没
+        # M2: 观测自带的合法性掩码（B, 2306），非法 logit 在头内被淹没
         mask = obs.get("action_mask", None) if hasattr(obs, "get") else None
-        action_dist = self._frozen_actor(feat, mask=mask)
-        # (B, A)
-        action = action_dist.mode if eval else action_dist.rsample()
+        if self._needs_hand_ids:
+            hand_ids = obs["hand_ids"].unsqueeze(1)  # (B,1,4)
+            action_dist = self._frozen_actor(feat.unsqueeze(1), mask=mask.unsqueeze(1), hand_ids=hand_ids)
+            action = (action_dist.mode if eval else action_dist.rsample()).squeeze(1)
+        else:
+            action_dist = self._frozen_actor(feat, mask=mask)
+            action = action_dist.mode if eval else action_dist.rsample()
         return action, TensorDict(
             {"stoch": stoch, "deter": deter, "prev_action": action},
             batch_size=state.batch_size,
@@ -481,14 +493,21 @@ class Dreamer(nn.Module):
         # 掩码沿轨迹缓变，槽位/放置区只在出牌后变化）。首步严格，后续步为
         # 有界的启发式；未提供掩码时退化为无掩码。
         masks = data.get("action_mask", None)
+        hand = data.get("hand_ids", None)
+        H = self.imag_horizon + 1
         imag_masks = None
+        imag_hand = None
         if masks is not None:
-            H = self.imag_horizon + 1
             Tm = masks.shape[1]
             idx = (torch.arange(Tm, device=masks.device).unsqueeze(0)
                    + torch.arange(H, device=masks.device).unsqueeze(1)).clamp(max=Tm - 1)
             imag_masks = masks[:, idx].reshape(-1, H, masks.shape[-1])  # (B*T, H, A)
-        imag_feat, imag_action = self._imagine(start, self.imag_horizon + 1, masks=imag_masks)
+        if hand is not None and self._needs_hand_ids:
+            Th = hand.shape[1]
+            idxh = (torch.arange(Th, device=hand.device).unsqueeze(0)
+                    + torch.arange(H, device=hand.device).unsqueeze(1)).clamp(max=Th - 1)
+            imag_hand = hand[:, idxh].reshape(-1, H, hand.shape[-1])    # (B*T, H, 4)
+        imag_feat, imag_action = self._imagine(start, self.imag_horizon + 1, masks=imag_masks, hand_ids=imag_hand)
         imag_feat, imag_action = imag_feat.detach(), imag_action.detach()
 
         # (B*T, T_imag, 1)
@@ -510,7 +529,7 @@ class Dreamer(nn.Module):
         # (B*T, T_imag-1, 1)
         adv = (ret - imag_value[:, :-1]) / ret_scale
 
-        policy = self.actor(imag_feat, mask=imag_masks)
+        policy = self.actor(imag_feat, mask=imag_masks, hand_ids=imag_hand)
         # (B*T, T_imag-1, 1)
         logpi = policy.log_prob(imag_action)[:, :-1].unsqueeze(-1)
         entropy = policy.entropy()[:, :-1].unsqueeze(-1)
@@ -577,7 +596,7 @@ class Dreamer(nn.Module):
         return (post_stoch, post_deter), metrics
 
     @torch.no_grad()
-    def _imagine(self, start, imag_horizon, masks=None):
+    def _imagine(self, start, imag_horizon, masks=None, hand_ids=None):
         """Roll out the policy in latent space."""
         # (B, S, K), (B, D)
         feats = []
@@ -586,9 +605,15 @@ class Dreamer(nn.Module):
         for step in range(imag_horizon):
             # (B, F)
             feat = self._frozen_rssm.get_feat(stoch, deter)
-            # (B, A) — M2: 逐步注入该步的合法掩码
+            # (B, A) — M2: 逐步注入该步的合法掩码；S5: 手牌沿轨迹前向持有
+            # （与掩码同一近似：手牌只在出牌后变化，出牌间隔 ≥ 决策数步）
             mask = masks[:, step] if masks is not None else None
-            action = self._frozen_actor(feat, mask=mask).rsample()
+            hand = hand_ids[:, step] if hand_ids is not None else None
+            actor = self._frozen_actor
+            if self._needs_hand_ids:
+                action = actor(feat, mask=mask, hand_ids=hand).rsample()
+            else:
+                action = actor(feat, mask=mask).rsample()
             # Append feat and its corresponding sampled action at the same time step.
             feats.append(feat)
             actions.append(action)
