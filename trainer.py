@@ -130,6 +130,7 @@ class OnlineTrainer:
         done = torch.ones(envs.env_num, dtype=torch.bool, device=agent.device)
         returns = torch.zeros(envs.env_num, dtype=torch.float32, device=agent.device)
         lengths = torch.zeros(envs.env_num, dtype=torch.int32, device=agent.device)
+        episode_counter = int(getattr(envs, "start_episode_index", 0))
         episode_ids = torch.arange(
             envs.env_num, dtype=torch.int32, device=agent.device
         )  # Kept constant so short episodes (< batch_length) remain sampable; RSSM resets via is_first.
@@ -205,6 +206,8 @@ class OnlineTrainer:
                             video_cache = []
                         self.logger.scalar("episode/score", returns[i])
                         self.logger.scalar("episode/length", lengths[i])
+                        episode_counter += 1
+                        self.logger.scalar("episode/index", episode_counter)  # 全局第几局（含热身）
                         self.logger.write(step + i)  # to show all values on tensorboard
                         returns[i] = lengths[i] = 0
             step += int((~done).sum()) * self._action_repeat  # step is based on env side
