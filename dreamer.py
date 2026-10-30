@@ -546,7 +546,12 @@ class Dreamer(nn.Module):
         )  # (B*T, T_imag-1, 1)
         ret_offset, ret_scale = self.return_ema(ret)
         # (B*T, T_imag-1, 1)
-        adv = (ret - imag_value[:, :-1]) / ret_scale
+        raw_adv = ret - imag_value[:, :-1]          # 未归一化残差（审计 ret_scale 用）
+        adv = raw_adv / ret_scale
+        # S4 审计指标：稀疏结构直接测量（f = 非零步占比，σ_res = 原始残差 std）
+        metrics["adv_raw_std"] = torch.std(raw_adv)
+        metrics["adv_nonzero_frac"] = torch.mean((raw_adv.abs() > 1e-6).to(torch.float32))
+        metrics["ret_scale"] = torch.as_tensor(ret_scale).reshape(()).to(torch.float32)
 
         policy = self.actor(imag_feat, mask=imag_masks, hand_ids=imag_hand)
         # (B*T, T_imag-1, 1)
