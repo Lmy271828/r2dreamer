@@ -671,3 +671,72 @@ class CardActionHead(nn.Module):
     def forward(self, x, mask=None, hand_ids=None):
         assert hand_ids is not None, "CardActionHead requires obs['hand_ids']"
         return CardFlatDist(self.inner(x, hand_ids, mask), self.cell_num)
+
+
+class DeckEncoder(nn.Module):
+    """S4 卡组编码器：可学习槽位编码 + 双向 Transformer（docs/s4_deck_encoder.md）。
+
+    deck_ids (..., 8) → 槽位嵌入相加 → 双向 self-attention → attention 后
+    mean 池化 → (..., d)。卡嵌入与 actor 卡头共享 CardEmbeddingTable。
+    """
+
+    def __init__(self, card_table: CardEmbeddingTable, layers: int = 1, heads: int = 4):
+        super().__init__()
+        self.card_table = card_table
+        d = card_table.dim
+        self.d = d
+        self.slot_pos = nn.Parameter(torch.zeros(8, d))
+        nn.init.normal_(self.slot_pos, std=0.02)
+        layer = nn.TransformerEncoderLayer(
+            d_model=d, nhead=heads, dim_feedforward=2 * d,
+            dropout=0.0, batch_first=True, norm_first=True,
+        )
+        self.tr = nn.TransformerEncoder(layer, num_layers=layers)
+        self.norm = nn.LayerNorm(d)
+
+    def forward(self, deck_ids):
+        lead = deck_ids.shape[:-1]
+        emb = self.card_table.encode_cards(deck_ids) + self.slot_pos    # (...,8,d)
+        x = emb.reshape(-1, 8, self.d)
+        x = self.tr(x)
+        x = x.reshape(*lead, 8, self.d)
+        return self.norm(x.mean(-2))                                    # (...,d)
+
+    def unk_vector(self, batch):
+        """CFG 丢弃时替换对手卡组条件的 UNK 向量（0 号 = UNK 行的均值）。"""
+        zeros = torch.zeros(batch, 8, dtype=torch.long, device=self.slot_pos.device)
+        return self(zeros)                                              # (batch,d)
+
+
+class DeckCondValueHead(nn.Module):
+    """S4 条件化 value：V(feat, deck0, drop(deck1))。
+
+    对外仍是 MLPHead 式调用约定（forward(feat) → 分布），额外要求传
+    deck_ids (B,8) 与 opp_deck_ids (B,8)（episode 级常量）。feat 支持
+    (B,T,F) 与 (B*T, F) 两种形状，条件向量内部广播。
+    opp_dropout：训练期按序列级 mask 把对手条件替换为 UNK 向量（CFG 式），
+    同一网络同时学条件模式 V(s,d0,d1) 与边缘模式 V(s,d0)。
+    """
+
+    def __init__(self, config, feat_dim, card_table: CardEmbeddingTable, opp_dropout: float = 0.25):
+        super().__init__()
+        self.deck_enc = DeckEncoder(card_table)
+        self.opp_dropout = float(opp_dropout)
+        self.value = MLPHead(config, feat_dim + 2 * card_table.dim)
+
+    def forward(self, feat, deck_ids=None, opp_deck_ids=None, drop_opp=None):
+        if deck_ids is None:
+            return self.value(feat)
+        B = deck_ids.shape[0]
+        own = self.deck_enc(deck_ids)                                   # (B,d)
+        opp = self.deck_enc(opp_deck_ids)
+        if drop_opp is not None:
+            unk = self.deck_enc.unk_vector(B)
+            opp = torch.where(drop_opp.reshape(B, 1), unk.to(opp.dtype), opp)
+        cond = torch.cat([own, opp], dim=-1)                            # (B,2d)
+        if feat.dim() == 2:      # (B*T, F)——想象轨迹展平
+            T = feat.shape[0] // B
+            cond = cond.unsqueeze(1).expand(B, T, cond.shape[-1]).reshape(B * T, -1)
+        else:                    # (B,T,F)
+            cond = cond.unsqueeze(1).expand(B, feat.shape[1], cond.shape[-1])
+        return self.value(torch.cat([feat, cond], dim=-1))

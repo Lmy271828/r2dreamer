@@ -689,6 +689,9 @@ class FirstLight(gym.Env):
                 "elixir_rate": gym.spaces.Box(0, 1, (1,), dtype=np.float32),
                 "hand_ids": gym.spaces.Box(0, 300, (4,), dtype=np.int64),
                 "deck_ids": gym.spaces.Box(0, 300, (8,), dtype=np.int64),
+                # S4：对手卡组（episode 级常量）。仅 DeckCondValueHead 消费；
+                # encoder 的 mlp_keys 不含此键（特权信息不进策略/世界模型输入）。
+                "opp_deck_ids": gym.spaces.Box(0, 300, (8,), dtype=np.int64),
                 "action_mask": gym.spaces.Box(0, 1, (ACTION_DIM,), dtype=np.uint8),
             }
         )
@@ -828,6 +831,7 @@ class FirstLight(gym.Env):
             "elixir_rate": np.array([self._elixir_rate(obs0.tick)], dtype=np.float32),
             "hand_ids": self._hand_ids(native_now),
             "deck_ids": np.array([DECK_INDEX[c] for c in self._deck0], dtype=np.int64),
+            "opp_deck_ids": np.array([DECK_INDEX[c] for c in self._deck1], dtype=np.int64),
             "action_mask": self._mask_flat(),
         }
         self._track_abilities(obs0)
@@ -884,6 +888,8 @@ class FirstLight(gym.Env):
                 "image": np.zeros(self._size + (3,), dtype=np.uint8),
                 "elixir": np.zeros(1, dtype=np.float32),
                 "elixir_rate": np.zeros(1, dtype=np.float32),
+                "deck_ids": np.zeros(8, dtype=np.int64),
+                "opp_deck_ids": np.zeros(8, dtype=np.int64),
                 "hand_ids": self._hand_ids(native_now),
                 "action_mask": self._mask_flat(),
             }
@@ -988,6 +994,7 @@ class FirstLight(gym.Env):
             "elixir_rate": np.array([self._elixir_rate(obs0.tick)], dtype=np.float32),
             "hand_ids": self._hand_ids(native_now),
             "deck_ids": np.array([DECK_INDEX[c] for c in self._deck0], dtype=np.int64),
+            "opp_deck_ids": np.array([DECK_INDEX[c] for c in self._deck1], dtype=np.int64),
             "action_mask": self._mask_flat(),
         }
         if self._mask1 is not None:

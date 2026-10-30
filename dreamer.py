@@ -66,7 +66,15 @@ class Dreamer(nn.Module):
         else:
             self.actor = networks.MLPHead(config.actor, self.rssm.feat_size)
             self._needs_hand_ids = False
-        self.value = networks.MLPHead(config.critic, self.rssm.feat_size)
+        # S4：obs 含 deck_ids/opp_deck_ids → 条件化 value（DeckEncoder +
+        # CFG 式对手条件 dropout，同一网络双模式，见 docs/s4_deck_encoder.md）
+        self._cond_value = "deck_ids" in getattr(obs_space, "spaces", {})
+        if self._cond_value:
+            self.value = networks.DeckCondValueHead(
+                config.critic, self.rssm.feat_size, networks.default_card_table()
+            )
+        if not self._cond_value:  # S4 条件化构造见上方（勿覆盖）
+            self.value = networks.MLPHead(config.critic, self.rssm.feat_size)
         self.slow_target_update = int(config.slow_target_update)
         self.slow_target_fraction = float(config.slow_target_fraction)
         self._slow_value = copy.deepcopy(self.value)
@@ -515,8 +523,19 @@ class Dreamer(nn.Module):
         # (B*T, T_imag, 1)  probability of continuation
         imag_cont = self._frozen_cont(imag_feat).mean
         # (B*T, T_imag, 1)
-        imag_value = self._frozen_value(imag_feat).mode()
-        imag_slow_value = self._frozen_slow_value(imag_feat).mode()
+        # S4 条件化：deck 为 episode 级常量，想象里沿轨迹复制（精确非近似）
+        d0 = d1 = drop = None
+        if self._cond_value:
+            d0 = data["deck_ids"][:, 0]                       # (B,8)
+            d1 = data["opp_deck_ids"][:, 0]
+            drop = torch.rand(d0.shape[0], device=d0.device) < 0.25  # 序列级 CFG
+            BT = imag_feat.shape[0]
+            reps = BT // d0.shape[0]
+            d0i = d0.repeat_interleave(reps, dim=0)      # (B*T, 8) 想象展平
+            d1i = d1.repeat_interleave(reps, dim=0)
+            dropi = drop.repeat_interleave(reps, dim=0)
+        imag_value = self._frozen_value(imag_feat, d0i, d1i, dropi).mode() if self._cond_value             else self._frozen_value(imag_feat).mode()
+        imag_slow_value = self._frozen_slow_value(imag_feat, d0i, d1i, dropi).mode() if self._cond_value             else self._frozen_slow_value(imag_feat).mode()
         disc = 1 - 1 / self.horizon
         # (B*T, T_imag, 1)
         weight = torch.cumprod(imag_cont * disc, dim=1)
@@ -561,7 +580,7 @@ class Dreamer(nn.Module):
             metrics["action_type_play"] = torch.mean(((idx >= 1) & (idx <= A - 2)).to(torch.float32))
             metrics["action_type_ability"] = torch.mean((idx == A - 1).to(torch.float32))
 
-        imag_value_dist = self.value(imag_feat)
+        imag_value_dist = self.value(imag_feat, d0i, d1i, dropi) if self._cond_value             else self.value(imag_feat)
         # (B*T, T_imag, 1)
         tar_padded = torch.cat([ret, 0 * ret[:, -1:]], 1)
         losses["value"] = torch.mean(
@@ -594,15 +613,19 @@ class Dreamer(nn.Module):
         )
         feat = self.rssm.get_feat(post_stoch, post_deter)
         boot = ret[:, 0].reshape(B, T, 1)
-        value = self._frozen_value(feat).mode()
-        slow_value = self._frozen_slow_value(feat).mode()
+        d0r = d1r = None
+        if self._cond_value:
+            d0r = data["deck_ids"][:, 0]
+            d1r = data["opp_deck_ids"][:, 0]
+        value = self._frozen_value(feat, d0r, d1r, drop).mode() if self._cond_value             else self._frozen_value(feat).mode()
+        slow_value = self._frozen_slow_value(feat, d0r, d1r, drop).mode() if self._cond_value             else self._frozen_slow_value(feat).mode()
         disc = 1 - 1 / self.horizon
         weight = 1.0 - last
         ret = self._lambda_return(last, term, reward, value, boot, disc, self.lamb)
         ret_padded = torch.cat([ret, 0 * ret[:, -1:]], 1)
 
         # Keep this attached to the world model so gradients can flow through
-        value_dist = self.value(feat)
+        value_dist = self.value(feat, d0r, d1r, drop) if self._cond_value             else self.value(feat)
         losses["repval"] = torch.mean(
             weight[:, :-1]
             * (-value_dist.log_prob(ret_padded.detach()) - value_dist.log_prob(slow_value.detach()))[:, :-1].unsqueeze(
