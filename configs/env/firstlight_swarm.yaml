@@ -12,7 +12,7 @@ device: ${device}
 size: [176, 128]
 speed: 2.0
 capture: 'stream'
-deck_mode: 'random_paired'  # B 臂启用：奇偶局同 seed 成对换边（运气对消，docs/ablation_paired_swap.md §6）
+deck_mode: 'random'      # A 臂+S4：补全 2x2 消融矩阵缺失格（vs 172220 B+S4），判据见 ablation_paired_swap.md §6
 opp_policy: 'selfplay'   # M5：对手 = 主策略冻结快照（前 40 局脚本热身，每 30 局刷新）
 selfplay_warmup: 40
 selfplay_refresh: 30
