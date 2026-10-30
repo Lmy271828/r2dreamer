@@ -483,6 +483,8 @@ class FirstLight(gym.Env):
     @staticmethod
     def _flat_index_of(act):
         """ActionV1 → 扁平索引（T0 重放用）。"""
+        from native_runner.contracts import ActionKind  # noqa: F401 -- 函数局部（_ensure_imports 的 import 不外泄）
+
         if act is None:
             return None
         if act.kind == ActionKind.WAIT:
