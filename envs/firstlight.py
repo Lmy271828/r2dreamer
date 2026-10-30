@@ -259,6 +259,12 @@ class FirstLight(gym.Env):
         self._opp_last = "init"
         self._swap_next = False  # 换边双打：下局 deck0/deck1 互换
         self._pair_prev = None  # random_paired：奇数局的 (seed, deck0, deck1)，偶数局复用交换
+        # T0 无损日志（docs/emergence_probes.md）：per-episode jsonl = seed+双方卡组+双方逐步动作+终局
+        self._t0_dir = Path(os.environ.get(
+            "CR_T0_DIR", str(Path(FIRSTLIGHT_ROOT).parent / "t0_log")))
+        self._t0_file = None
+        self._ep_meta = None
+        self._ep_actions = []
         self._deck_override = None   # 换边双打 harness：显式指定下局双方卡组
         self._seed_override = None
         # 多实例：serial/control_port 覆盖 .env 的单实例默认值
@@ -459,6 +465,44 @@ class FirstLight(gym.Env):
         except Exception as error:  # noqa: BLE001 -- 对手故障绝不带崩采集
             self._opp_last = f"err:{str(error)[:60]}"
             return self._action_v1.wait(1, ticks=10, execute_offset_ticks=3)
+
+    def _t0_begin(self, seed, deck0, deck1):
+        """开局：设定本局 T0 文件路径并写 meta（终局时一并落盘）。"""
+        try:
+            d = self._t0_dir / f"env_{int(self._control_port or 26789)}"
+            d.mkdir(parents=True, exist_ok=True)
+            self._ep_meta = {"type": "meta", "seed": int(seed),
+                             "deck0": [int(c) for c in deck0], "deck1": [int(c) for c in deck1],
+                             "episode": int(self._episodes)}
+            self._ep_actions = []
+            self._t0_file = d / f"ep_{self._episodes}.jsonl"
+        except Exception as e:  # noqa: BLE001 -- 日志失败不影响训练
+            print(f"FirstLight: T0 open failed: {str(e)[:80]}", flush=True)
+            self._t0_file = None
+
+    def _t0_step(self, a0, a1):
+        if self._t0_file is not None:
+            self._ep_actions.append((int(a0), None if a1 is None else int(a1)))
+
+    def _t0_end(self, reward, terminated, truncated, info):
+        """终局/中止：落盘整局（meta + 逐步双方动作 + 终局）。"""
+        if self._t0_file is None or self._ep_meta is None:
+            return
+        try:
+            with open(self._t0_file, "w", encoding="utf-8") as f:
+                f.write(json.dumps(self._ep_meta) + chr(10))
+                for a0, a1 in self._ep_actions:
+                    f.write(json.dumps({"a0": a0, "a1": a1}) + chr(10))
+                f.write(json.dumps({
+                    "type": "terminal", "reward": float(reward),
+                    "terminated": bool(terminated), "truncated": bool(truncated),
+                    "reason": str((info or {}).get("terminal_reason", "aborted")),
+                }) + chr(10))
+        except Exception as e:  # noqa: BLE001
+            print(f"FirstLight: T0 write failed: {str(e)[:80]}", flush=True)
+        self._t0_file = None
+        self._ep_meta = None
+        self._ep_actions = []
 
     def _align_log_tick(self, tick, engine_elixir=None):
         """M1 对齐旁路：被动记录每步的引擎 tick 与帧龄。
@@ -835,6 +879,7 @@ class FirstLight(gym.Env):
             "action_mask": self._mask_flat(),
         }
         self._track_abilities(obs0)
+        self._t0_begin(seed, self._deck0, self._deck1)
         if self._opp_policy == "selfplay":
             self._mask1 = self._battle.action_mask(1)
             self._track_abilities_owner(obs0, 1)
@@ -878,6 +923,7 @@ class FirstLight(gym.Env):
             )
             self._battle = None
             self._last_obs1 = None
+            self._t0_end(0.0, False, True, {"terminal_reason": "aborted"})
             return self._abort_episode_obs()
 
     def _abort_episode_obs(self):
@@ -975,10 +1021,13 @@ class FirstLight(gym.Env):
             )
 
         self._track_abilities(obs0)
+        self._t0_step(int(np.argmax(action).item()),
+                      None if action1 is None else int(np.argmax(action1).item()))
         if terminated or truncated:
             # 对局终局：引擎的回放播放器已停止 stepping，任何后续提交都会失败。
             # 自动重开下一局（ParallelEnv 惰性重置语义），终局奖励已在本步交付。
             self._needs_reset = True
+            self._t0_end(reward, terminated, truncated, info)
         self._mask = self._battle.action_mask(0)
         self._mask1 = self._battle.action_mask(1) if self._opp_policy == "selfplay" else None
         reward = np.float32(reward)

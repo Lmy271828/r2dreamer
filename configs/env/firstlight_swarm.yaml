@@ -12,7 +12,7 @@ device: ${device}
 size: [176, 128]
 speed: 2.0
 capture: 'stream'
-deck_mode: 'random'      # 主臂=A（独立随机双向）；B(random_paired) 保留为消融臂，见 docs/ablation_paired_swap.md
+deck_mode: 'random_paired'  # B 臂启用：奇偶局同 seed 成对换边（运气对消，docs/ablation_paired_swap.md §6）
 opp_policy: 'selfplay'   # M5：对手 = 主策略冻结快照（前 40 局脚本热身，每 30 局刷新）
 selfplay_warmup: 40
 selfplay_refresh: 30
