@@ -1038,7 +1038,8 @@ class FirstLight(gym.Env):
             )
 
         self._track_abilities(obs0)
-        self._t0_step(int(np.argmax(action).item()), self._flat_index_of(opp))
+        # wrapper 链已把 one-hot 转成扁平索引，此处 action 就是 int
+        self._t0_step(int(action), self._flat_index_of(opp))
         if terminated or truncated:
             # 对局终局：引擎的回放播放器已停止 stepping，任何后续提交都会失败。
             # 自动重开下一局（ParallelEnv 惰性重置语义），终局奖励已在本步交付。
