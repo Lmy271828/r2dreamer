@@ -293,7 +293,7 @@ class FirstLight(gym.Env):
 
     def _ensure_imports(self):
         from native_runner.battle_env import BattleEnvError, BattleEnvV1
-        from native_runner.contracts import ActionV1
+        from native_runner.contracts import ActionKind, ActionV1
         from native_runner.local_config import load_env, setting
         from native_runner.match_factory import MatchConfig, STANDARD_DECK
 
@@ -479,6 +479,21 @@ class FirstLight(gym.Env):
         except Exception as e:  # noqa: BLE001 -- 日志失败不影响训练
             print(f"FirstLight: T0 open failed: {str(e)[:80]}", flush=True)
             self._t0_file = None
+
+    @staticmethod
+    def _flat_index_of(act):
+        """ActionV1 → 扁平索引（T0 重放用）。"""
+        if act is None:
+            return None
+        if act.kind == ActionKind.WAIT:
+            return 0
+        if act.kind == ActionKind.ACTIVATE_ABILITY:
+            return ABILITY_INDEX
+        slot, grid = act.hand_slot, act.target_grid
+        if slot is None or grid is None:
+            return 0
+        cy, cx = grid[1], grid[0]
+        return 1 + slot * CELLS + cy * GRID_W + cx
 
     def _t0_step(self, a0, a1):
         if self._t0_file is not None:
@@ -1021,8 +1036,7 @@ class FirstLight(gym.Env):
             )
 
         self._track_abilities(obs0)
-        self._t0_step(int(np.argmax(action).item()),
-                      None if action1 is None else int(np.argmax(action1).item()))
+        self._t0_step(int(np.argmax(action).item()), self._flat_index_of(opp))
         if terminated or truncated:
             # 对局终局：引擎的回放播放器已停止 stepping，任何后续提交都会失败。
             # 自动重开下一局（ParallelEnv 惰性重置语义），终局奖励已在本步交付。
