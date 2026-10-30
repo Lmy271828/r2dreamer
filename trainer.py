@@ -131,6 +131,7 @@ class OnlineTrainer:
         returns = torch.zeros(envs.env_num, dtype=torch.float32, device=agent.device)
         lengths = torch.zeros(envs.env_num, dtype=torch.int32, device=agent.device)
         episode_counter = int(getattr(envs, "start_episode_index", 0))
+        win_history = []  # M5：主策略对快照胜率的滚动窗口（对脚本对手时语义为对脚本胜率）
         episode_ids = torch.arange(
             envs.env_num, dtype=torch.int32, device=agent.device
         )  # Kept constant so short episodes (< batch_length) remain sampable; RSSM resets via is_first.
@@ -207,7 +208,11 @@ class OnlineTrainer:
                         self.logger.scalar("episode/score", returns[i])
                         self.logger.scalar("episode/length", lengths[i])
                         episode_counter += 1
-                        self.logger.scalar("episode/index", episode_counter)  # 全局第几局（含热身）
+                        win_history.append(1.0 if returns[i] > 0 else 0.0)
+                        if len(win_history) > 15:
+                            win_history.pop(0)
+                        self.logger.scalar("episode/index", episode_counter)  # 全局第几局（含热身）；wandb 面板 x 轴选它，曲线本身可隐藏
+                        self.logger.scalar("episode/win_rate", sum(win_history) / len(win_history))  # 主策略平均胜率（滚动 15 局）
                         self.logger.write(step + i)  # to show all values on tensorboard
                         returns[i] = lengths[i] = 0
             step += int((~done).sum()) * self._action_repeat  # step is based on env side
