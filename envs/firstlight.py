@@ -258,6 +258,7 @@ class FirstLight(gym.Env):
         self._opp_plays = 0
         self._opp_last = "init"
         self._swap_next = False  # 换边双打：下局 deck0/deck1 互换
+        self._pair_prev = None  # random_paired：奇数局的 (seed, deck0, deck1)，偶数局复用交换
         self._deck_override = None   # 换边双打 harness：显式指定下局双方卡组
         self._seed_override = None
         # 多实例：serial/control_port 覆盖 .env 的单实例默认值
@@ -720,7 +721,23 @@ class FirstLight(gym.Env):
         return np.array((ids + [0] * 4)[:4], dtype=np.int64)
 
     def _sample_decks(self, seed):
-        """按 deck_mode 采样双方卡组（fixed 模式保持构造时的组态）。"""
+        """按 deck_mode 采样双方卡组（fixed 模式保持构造时的组态）。
+
+        random_paired（M5 主线，docs/ablation_paired_swap.md 升级）：奇数局
+        独立抽 (dA, dB) 并寄存；偶数局复用同 seed + 交换角色 (dB, dA)——
+        同 matchup 两方向在相同 dynamics/运气下成对出现，advantage 运气
+        项严格对消。harness 的 deck_override 优先于配对。
+        """
+        if self._deck_mode == "random_paired":
+            if self._pair_prev is not None and self._episodes % 2 == 0:
+                return False  # 偶数局：由 reset 套用寄存的换边对（不重抽）
+            if not DECK_POOL:
+                raise RuntimeError("deck_mode=random_paired but card pool is empty")
+            rng = np.random.default_rng(seed)
+            self._deck0 = tuple(int(c) for c in rng.choice(DECK_POOL, size=8, replace=False))
+            self._deck1 = tuple(int(c) for c in rng.choice(DECK_POOL, size=8, replace=False))
+            self._pair_prev = (seed, self._deck0, self._deck1)  # 奇数局寄存
+            return True
         if self._deck_mode == "random":
             if not DECK_POOL:
                 raise RuntimeError("deck_mode=random but card pool is empty")
@@ -748,6 +765,11 @@ class FirstLight(gym.Env):
             if self._seed_override is not None:
                 seed = self._seed_override
                 self._seed_override = None
+            self._pair_prev = None  # harness 显式对局不参与配对
+        elif (self._deck_mode == "random_paired"
+              and self._pair_prev is not None and self._episodes % 2 == 0):
+            seed, (self._deck0, self._deck1) = self._pair_prev[0], (self._pair_prev[2], self._pair_prev[1])
+            self._pair_prev = None  # 配对完成
         else:
             self._sample_decks(seed)
         deck0, deck1 = (self._deck1, self._deck0) if self._swap_next else (self._deck0, self._deck1)
@@ -825,6 +847,10 @@ class FirstLight(gym.Env):
                 "action_mask": self._mask_flat(self._mask1),
             }
         self._align_log_tick(obs0.tick, engine_elixir=float(next(p for p in obs0.players if p.owner == 0).elixir_exact or 0.0))
+        if self._episodes % 25 == 1:  # 覆盖审计抽样：每 25 局打印一次卡组对（coverage sentinel）
+            print(f"FirstLight: ep{self._episodes} decks pair-hash="
+                  f"{hash((self._deck0, self._deck1)) & 0xffffff:x} "
+                  f"deck0sorted={tuple(sorted(self._deck0))}", flush=True)
         self._last_obs = obs
         return obs
 

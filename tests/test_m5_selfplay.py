@@ -145,8 +145,39 @@ def test_snapshot_refresh():
     print('PASS: snapshot deepcopy/load_state_dict/act(obs1)')
 
 
+def test_random_paired():
+    """random_paired：奇偶局同 seed 成对换边（A/B 臂升级主线的采样器）。"""
+    env = object.__new__(FirstLight)
+    env._deck_mode = 'random_paired'
+    env._episodes = 1
+    env._pair_prev = None
+    env._deck_override = None
+    env._seed_override = None
+    env._deck0 = env._deck1 = None
+
+    # 奇数局：正常抽并寄存
+    assert env._sample_decks(123) is True
+    assert env._deck0 is not None and len(env._deck0) == 8
+    assert env._pair_prev == (123, env._deck0, env._deck1)
+    dA, dB = env._deck0, env._deck1
+
+    # 偶数局：不重抽（返回 False），reset 套用交换对
+    env._episodes = 2
+    assert env._sample_decks(999) is False   # 忽略新 seed
+    seed, (d0, d1) = env._pair_prev[0], (env._pair_prev[2], env._pair_prev[1])
+    assert seed == 123 and d0 == dB and d1 == dA
+    env._pair_prev = None                    # 配对完成
+
+    # 下一对的奇数局重新独立抽
+    env._episodes = 3
+    assert env._sample_decks(456) is True
+    assert env._deck0 != dA or env._deck1 != dB  # 新 pair 独立
+    print('PASS: random_paired odd/even seed-deck pairing')
+
+
 if __name__ == '__main__':
     test_selfplay_action_decode()
     test_pop_obs1()
     test_snapshot_refresh()
+    test_random_paired()
     print('ALL M5 TESTS PASSED')

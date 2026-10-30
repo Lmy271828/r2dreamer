@@ -12,7 +12,7 @@ device: ${device}
 size: [176, 128]
 speed: 2.0
 capture: 'stream'
-deck_mode: 'random'      # 账号卡池解锁后：deck0/deck1 双侧 122 池独立随机
+deck_mode: 'random_paired'  # M5 主线：奇偶局同 seed 成对换边（运气对消，见 docs/ablation_paired_swap.md）
 opp_policy: 'selfplay'   # M5：对手 = 主策略冻结快照（前 40 局脚本热身，每 30 局刷新）
 selfplay_warmup: 40
 selfplay_refresh: 30
