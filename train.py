@@ -52,6 +52,16 @@ def main(config):
         act_space,
     ).to(config.device)
 
+    # 断点续训（权重+optimizer）：+resume_ckpt=<latest.pt 路径>。
+    # replay buffer 不持久化（内存态），恢复后从空 buffer 重新采集，
+    # learner 会等 batch_length 帧回填后才恢复更新——权重热、数据冷。
+    resume_ckpt = str(config.get("resume_ckpt", "") or "")
+    if resume_ckpt:
+        blob = torch.load(resume_ckpt, map_location=config.device, weights_only=False)
+        agent.load_state_dict(blob["agent_state_dict"])
+        tools.recursively_load_optim_state_dict(agent, blob["optims_state_dict"])
+        print(f"Resumed weights+optim from {resume_ckpt} (replay buffer restarts empty)", flush=True)
+
     policy_trainer = OnlineTrainer(config.trainer, replay_buffer, logger, logdir, train_envs, eval_envs)
     policy_trainer.begin(agent)
 

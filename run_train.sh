@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # FirstLight 训练启动器：唯一 run 目录 + 标准覆盖 + 追加参数
 # 用法: ./run_train.sh <label> [额外 hydra overrides...]
+# 断点续训: ./run_train.sh <label> +resume_ckpt=runs/<旧run>/latest.pt
+#   （权重+optimizer 热恢复；replay buffer 从零回填，learner 自动等待 batch_length 帧）
 set -euo pipefail
 LABEL="${1:?usage: run_train.sh <label> [overrides...]}"; shift
 STAMP=$(date +%m%d_%H%M%S)

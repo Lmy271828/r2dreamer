@@ -477,11 +477,14 @@ class FirstLight(gym.Env):
         try:
             d = self._t0_dir / f"env_{int(self._control_port or 26789)}"
             d.mkdir(parents=True, exist_ok=True)
+            n = int(self._episodes)
+            while (d / f"ep_{n}.jsonl").exists():  # 断点续训/重跑不覆盖已有局
+                n += 1
             self._ep_meta = {"type": "meta", "seed": int(seed),
                              "deck0": [int(c) for c in deck0], "deck1": [int(c) for c in deck1],
                              "episode": int(self._episodes)}
             self._ep_actions = []
-            self._t0_file = d / f"ep_{self._episodes}.jsonl"
+            self._t0_file = d / f"ep_{n}.jsonl"
         except Exception as e:  # noqa: BLE001 -- 日志失败不影响训练
             print(f"FirstLight: T0 open failed: {str(e)[:80]}", flush=True)
             self._t0_file = None
