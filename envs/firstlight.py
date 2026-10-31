@@ -869,8 +869,9 @@ class FirstLight(gym.Env):
                 deck1=deck0,
                 # 座位名显式化：下方渲染=owner-0=本 agent；横幅文字是 HUD
                 # 摆放，不指示归属——观战时以手牌/圣水实测归属为准
-                owner0_name="P0-AGENT",
-                owner1_name="P1-OPPONENT",
+                # 座位翻转后：owner-0=上方红=对手快照，owner-1=下方蓝=主策略
+                owner0_name="P0-OPPONENT",
+                owner1_name="P1-AGENT",
                 level_cap=11,
                 minimum_card_level=11,
                 king_tower_level=11,
