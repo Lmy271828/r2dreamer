@@ -176,9 +176,39 @@ def test_random_paired():
     print('PASS: random_paired odd/even seed-deck pairing')
 
 
+def test_league_stats_writer(tmpdir=None):
+    """league_stats writer：终局聚合行落盘，aborted 局照记（消费侧过滤）。"""
+    import tempfile, json
+    from pathlib import Path
+    env = object.__new__(FirstLight)
+    d = Path(tempfile.mkdtemp())
+    env._t0_dir = d
+    env._t0_file = d / "ep_9.jsonl"
+    env._ep_meta = {"type": "meta", "seed": 42, "deck0": [1, 2, 3, 4, 5, 6, 7, 8],
+                    "deck1": [9, 10, 11, 12, 13, 14, 15, 16], "episode": 9}
+    env._ep_actions = [(0, None)]
+    env._t0_end(1.0, True, False, {"terminal_reason": "native_final_result"})
+    lines = [json.loads(l) for l in (d / "league_stats.jsonl").read_text().splitlines()]
+    assert len(lines) == 1
+    rec = lines[0]
+    assert rec["episode"] == 9 and rec["seed"] == 42
+    assert rec["agent_deck"] == [1, 2, 3, 4, 5, 6, 7, 8]
+    assert rec["opp_deck"] == [9, 10, 11, 12, 13, 14, 15, 16]
+    assert rec["score"] == 1.0 and rec["win"] is True and rec["reason"] == "native_final_result"
+    # aborted 局
+    env._t0_file = d / "ep_10.jsonl"
+    env._ep_meta = {"type": "meta", "seed": 42, "deck0": [1, 2, 3, 4, 5, 6, 7, 8],
+                    "deck1": [9, 10, 11, 12, 13, 14, 15, 16], "episode": 10}
+    env._t0_end(0.0, False, True, {"terminal_reason": "aborted"})
+    rec2 = [json.loads(l) for l in (d / "league_stats.jsonl").read_text().splitlines()][-1]
+    assert rec2["episode"] == 10 and rec2["win"] is False and rec2["reason"] == "aborted"
+    print('PASS: league_stats writer (final + aborted)')
+
+
 if __name__ == '__main__':
     test_selfplay_action_decode()
     test_pop_obs1()
     test_snapshot_refresh()
     test_random_paired()
+    test_league_stats_writer()
     print('ALL M5 TESTS PASSED')

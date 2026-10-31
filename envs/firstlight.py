@@ -523,6 +523,22 @@ class FirstLight(gym.Env):
                 }) + chr(10))
         except Exception as e:  # noqa: BLE001
             print(f"FirstLight: T0 write failed: {str(e)[:80]}", flush=True)
+        # league_stats（PFSP/校准的数据源，见 league 设计讨论）：每局一行
+        # 聚合记录。aborted 局照记但消费侧应按 reason 过滤。
+        try:
+            with open(self._t0_dir / "league_stats.jsonl", "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "episode": self._ep_meta["episode"],
+                    "seed": self._ep_meta["seed"],
+                    "agent_deck": self._ep_meta["deck0"],
+                    "opp_deck": self._ep_meta["deck1"],
+                    "score": float(reward),
+                    "win": bool(reward > 0),
+                    "terminated": bool(terminated),
+                    "reason": str((info or {}).get("terminal_reason", "aborted")),
+                }) + chr(10))
+        except Exception as e:  # noqa: BLE001
+            print(f"FirstLight: league_stats write failed: {str(e)[:80]}", flush=True)
         self._t0_file = None
         self._ep_meta = None
         self._ep_actions = []
