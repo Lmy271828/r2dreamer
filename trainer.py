@@ -33,6 +33,63 @@ class OnlineTrainer:
         self._should_eval = tools.Every(self.eval_every)
         self._action_repeat = config.action_repeat
 
+    def _run_selector_round(self, agent, envs):
+        """League ③④⑤ 一轮：league_stats → 门禁 → 爬山 → shadow/注入。"""
+        import json
+        try:
+            stats_file = Path(self.logger._logdir) / "league_stats.jsonl"
+            if not stats_file.exists():
+                return
+            stats_rows = [json.loads(l) for l in
+                          stats_file.read_text(encoding="utf-8").splitlines() if l.strip()]
+            if len(stats_rows) < 20:
+                return  # 数据太少
+            probes = []        # KL 探针序列（待 snapshot KL 探针产出后接入）
+            wm_plateau = False  # loss/dyn、loss/rew 斜率探针接入前恒 False → 必 shadow
+            sel = self._selector.select(
+                stats_rows, probes, wm_plateau,
+                score_fn=self._selector_score_fn(agent, envs),
+                agent_deck=list(envs._envs[0]._deck0))
+            info = sel["info"]
+            self.logger.scalar("league/round", info["round"])
+            self.logger.scalar("league/gates_ok", 1.0 if info["gates_ok"] else 0.0)
+            print(f"league round {info['round']}: mode={info['mode']} "
+                  f"reasons={info['reasons']}", flush=True)
+            if sel["mode"].startswith("active") and self.selector_mode == "active":
+                for i in range(envs.env_num):
+                    envs.set_next_match(i, sel["deck0"], sel["deck1"])
+                print("league: next matches overridden by selector", flush=True)
+        except Exception:  # noqa: BLE001 -- 选卡器故障绝不带崩训练
+            import traceback
+            traceback.print_exc()
+
+    def _selector_score_fn(self, agent, envs):
+        """V(s_open, d) 直接读出打分回调。开局帧 = env 战场截取（(176,128,3)）。"""
+        import numpy as np
+        state = {"feat": None}
+
+        def score(deck):
+            from envs.firstlight import DECK_INDEX
+            if state["feat"] is None:
+                frame = envs._envs[0]._capture()          # (176,128,3) uint8 战场
+                feat_img = torch.from_numpy(frame).unsqueeze(0).float() / 255.0
+                embed = agent.encoder({
+                    "image": feat_img,
+                    "elixir": torch.tensor([[5.0]]),
+                    "elixir_rate": torch.tensor([[2.5 / 60.0]]),
+                })
+                st, de = agent.rssm.initial(1)
+                st, de, _ = agent.rssm.obs_step(st, de, torch.zeros(1, agent.act_dim),
+                                                embed, torch.zeros(1, dtype=torch.bool))
+                state["feat"] = agent.rssm.get_feat(st, de)
+            ids = torch.tensor([[DECK_INDEX[c] for c in deck]], dtype=torch.long)
+            with torch.no_grad():
+                v = agent.value(state["feat"], ids, torch.zeros_like(ids),
+                                drop_opp=None).mode().squeeze(-1)
+            return float(v)
+
+        return score
+
     def eval(self, agent, train_step):
         """Run evaluation episodes.
 
@@ -119,6 +176,18 @@ class OnlineTrainer:
         # act1=None（env 回退随机脚本），warmup 后 deepcopy 快照接管，
         # 每 refresh_episodes 局用主策略权重刷新一次。
         selfplay = getattr(envs, "selfplay", False)
+        # League ③④⑤：选卡器（docs/deck_selection.md）。默认 shadow——
+        # 双门（KL 探针+WM 平台化+数据成熟度）通过才 active，否则只算不干预。
+        self.selector_mode = str(getattr(envs, "selector_mode", "off"))
+        self.selector_every = int(getattr(envs, "selector_every", 30))
+        self._selector = None
+        self._selector_next_ep = self.selector_every
+        if self.selector_mode != "off":
+            from league import DeckSelector
+            self._selector = DeckSelector(
+                epsilon=float(getattr(envs, "selector_epsilon", 0.2)),
+                min_games=int(getattr(envs, "selector_min_games", 10)))
+            print(f"league: selector mode={self.selector_mode} every={self.selector_every} eps", flush=True)
         self._next_snapshot_update = self.snapshot_every
         self._opp_agent = None
         # M5 断点续训的联赛成熟态：恢复时优先读本 run 的 league_state.pt
@@ -301,6 +370,10 @@ class OnlineTrainer:
             done = step_done.to(agent.device)
             if selfplay:
                 self._opp_episodes += int(done.sum())
+            if (self._selector is not None
+                    and self._opp_episodes >= self._selector_next_ep):
+                self._selector_next_ep += self.selector_every
+                self._run_selector_round(agent, envs)
 
             # Policy inference on GPU.
             # "agent_state" is reset by the agent based on the "is_first" flag in trans.

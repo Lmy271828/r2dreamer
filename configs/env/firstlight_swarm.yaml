@@ -14,6 +14,12 @@ speed: 2.0
 capture: 'stream'
 deck_mode: 'random'      # A 臂+S4：补全 2x2 消融矩阵缺失格（vs 172220 B+S4），判据见 ablation_paired_swap.md §6
 opp_policy: 'selfplay'   # M5：对手 = 主策略冻结快照（前 40 局脚本热身，每 30 局刷新）
+# League ③④⑤：选卡器（docs/deck_selection.md）——shadow=只算排序不干预；
+# 双门通过后切 'active' 接管 deck0/deck1
+selector_mode: 'shadow'
+selector_every: 30
+selector_epsilon: 0.2
+selector_min_games: 10
 selfplay_warmup: 40
 selfplay_refresh: 30
 # 每 env 一个 MuMu 实例：env0 = index 1（原实例），env1 = index 0（克隆）

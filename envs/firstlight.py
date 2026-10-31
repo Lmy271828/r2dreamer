@@ -214,6 +214,10 @@ class FirstLightInlineEnv:
         self._needs_reset = [True] * self.env_num
         self._last_obs1 = [None] * self.env_num
 
+    def set_next_match(self, index, deck0, deck1, seed=None):
+        """M5 league ⑤：按 env 索引显式指定下一局双方卡组（透传 FirstLight）。"""
+        self._envs[index].set_next_match(deck0, deck1, seed=seed)
+
     def pop_obs1(self):
         """M5：取走本步的 owner-1 视图观测（TensorDict (B,1,*)）；缺任一即 None。"""
         torch = self._torch

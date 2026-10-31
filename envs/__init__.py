@@ -25,6 +25,10 @@ def make_envs(config):
         env.selfplay = str(config.get("opp_policy", "afk")) == "selfplay"
         env.selfplay_warmup = int(config.get("selfplay_warmup", 40))
         env.selfplay_refresh = int(config.get("selfplay_refresh", 30))
+        env.selector_mode = str(config.get("selector_mode", "off"))
+        env.selector_every = int(config.get("selector_every", 30))
+        env.selector_epsilon = float(config.get("selector_epsilon", 0.2))
+        env.selector_min_games = int(config.get("selector_min_games", 10))
         return env, None, env.observation_space, env.action_space
 
     def env_constructor(idx):
