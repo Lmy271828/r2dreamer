@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from tensordict import TensorDict
 
-from envs.firstlight import ABILITY_INDEX, ACTION_DIM, CELLS, FirstLight, FirstLightInlineEnv
+from envs.firstlight import ABILITY_INDEX, ACTION_DIM, CELLS, OPP_OWNER, FirstLight, FirstLightInlineEnv
 from native_runner.contracts import ActionV1, ActionKind
 
 
@@ -35,12 +35,13 @@ def _mask1():
 
 
 def _native_now():
+    # 座位翻转后：快照对手 = owner-0，手牌数据挂 owner-0；agent = owner-1
     return {"players": [
-        {"owner": 0, "hand": []},
-        {"owner": 1, "hand": [{"cardId": 26000069, "cost": 4, "handIndex": 0},
+        {"owner": 0, "hand": [{"cardId": 26000069, "cost": 4, "handIndex": 0},
                               {"cardId": 26000072, "cost": 4, "handIndex": 1},
                               {"cardId": 26000000, "cost": 3, "handIndex": 2},
                               {"cardId": 26000003, "cost": 5, "handIndex": 3}]},
+        {"owner": 1, "hand": []},
     ]}
 
 
@@ -48,7 +49,7 @@ class _Battle:
     def __init__(self):
         self.mask = _mask1()
     def action_mask(self, owner):
-        assert owner == 1
+        assert owner == OPP_OWNER  # 座位翻转后：对手 = owner-0
         return self.mask
 
 
@@ -63,11 +64,11 @@ def test_selfplay_action_decode():
 
     # WAIT（索引 0）
     a = env._selfplay_action(0, native_now)
-    assert a.kind == ActionKind.WAIT and a.owner == 1
+    assert a.kind == ActionKind.WAIT and a.owner == OPP_OWNER
 
     # 出牌：slot0 × cell(3,4) → play owner=1, hand_slot=0
     a = env._selfplay_action(1 + 0 * CELLS + 4 * 18 + 3, native_now)
-    assert a.kind == ActionKind.PLAY_CARD and a.owner == 1
+    assert a.kind == ActionKind.PLAY_CARD and a.owner == OPP_OWNER
     assert a.hand_slot == 0 and a.card_id == 26000069 and a.target_grid == (3, 4)
 
     # 非法槽（slot2 hand_slots=False）→ 降级 WAIT
@@ -76,7 +77,7 @@ def test_selfplay_action_decode():
 
     # 技能位 → ACTIVATE_ABILITY owner=1（实体/技能来自 owner-1 快照表）
     a = env._selfplay_action(ABILITY_INDEX, native_now)
-    assert a.kind == ActionKind.ACTIVATE_ABILITY and a.owner == 1
+    assert a.kind == ActionKind.ACTIVATE_ABILITY and a.owner == OPP_OWNER
     assert a.source_entity == 777 and a.ability_id == 'Deflect'
     print('PASS: _selfplay_action decode (wait/play/illegal/ability/warmup)')
 

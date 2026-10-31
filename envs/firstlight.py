@@ -77,6 +77,12 @@ GRID_W, GRID_H = 18, 32
 CELLS = GRID_W * GRID_H
 WAIT_INDEX = 0
 HAND_NUM = 4
+# M5.5 座位翻转：引擎渲染约定 owner-1 = 下方蓝方（GUI"下方 AI Checkpoint"=owner1
+# 同源）。主策略占 owner-1（下方蓝方、己方手牌+圣水在底部条），对手占 owner-0
+# （上方红方）。学习方像素视角与真实对战信息结构一致：看得见自己手牌+圣水、
+# 看不见对手手牌。trainer/dreamer 接口不变。
+AGENT_OWNER = 1
+OPP_OWNER = 0
 # 技能位（预留接口的扁平编码）：index 2305 = ACTIVATE_ABILITY。
 # 合法性由掩码末位给出（引擎 action_mask.ability_sources 非空），step 时
 # 解析出 (source_entity, ability_id) 提交 type-2 激活（无目标载荷）。
@@ -428,7 +434,7 @@ class FirstLight(gym.Env):
         """
         try:
             rng = np.random.default_rng()
-            mask1 = self._battle.action_mask(1)
+            mask1 = self._battle.action_mask(OPP_OWNER)
             # 决策窗未就绪的掩码只有 kinds/reasons、没有 hand_slots——此时
             # 若提交 wait 会把 owner-1 死线再推 10 tick，造成永久 AFK 锁。
             # 返回 None = 本窗不提交，死线自然过期，下一窗自愈就绪。
@@ -437,7 +443,7 @@ class FirstLight(gym.Env):
                 return None
             if rng.random() < self._opp_p_wait:
                 self._opp_last = "rng_wait"
-                return self._action_v1.wait(1, ticks=10, execute_offset_ticks=3)
+                return self._action_v1.wait(OPP_OWNER, ticks=10, execute_offset_ticks=3)
             choices = []
             for slot in range(4):
                 if not mask1.hand_slots[slot] or str(slot) not in mask1.placement_masks:
@@ -449,7 +455,7 @@ class FirstLight(gym.Env):
                             choices.append((slot, cx, cy))
             if not choices:
                 self._opp_last = "empty"
-                return self._action_v1.wait(1, ticks=10, execute_offset_ticks=3)
+                return self._action_v1.wait(OPP_OWNER, ticks=10, execute_offset_ticks=3)
             slot, cx, cy = choices[int(rng.integers(len(choices)))]
             try:
                 hand = next(p for p in (native_now or self._battle.native.observe())["players"] if p["owner"] == 1)["hand"]
@@ -464,7 +470,7 @@ class FirstLight(gym.Env):
             )
         except Exception as error:  # noqa: BLE001 -- 对手故障绝不带崩采集
             self._opp_last = f"err:{str(error)[:60]}"
-            return self._action_v1.wait(1, ticks=10, execute_offset_ticks=3)
+            return self._action_v1.wait(OPP_OWNER, ticks=10, execute_offset_ticks=3)
 
     def _t0_begin(self, seed, deck0, deck1):
         """开局：设定本局 T0 文件路径并写 meta（终局时一并落盘）。"""
@@ -566,9 +572,9 @@ class FirstLight(gym.Env):
 
         battle = self._battle
         battle.native.resume()
-        battle.step_actor(0, {0: [self._action_v1.wait(0)]})
+        battle.step_actor(AGENT_OWNER, {AGENT_OWNER: [self._action_v1.wait(0)]})
         if action is None:
-            result = battle.step_actor(0, {0: [self._action_v1.wait(0)]})
+            result = battle.step_actor(AGENT_OWNER, {AGENT_OWNER: [self._action_v1.wait(0)]})
             battle.native.pause()
             return result
 
@@ -579,7 +585,7 @@ class FirstLight(gym.Env):
             offset = max(1, int(action.execute_offset_ticks or 0)) + attempt * 2
             try:
                 result = battle.step_actor(
-                    0, {0: [replace(action, execute_offset_ticks=offset)]}
+                    AGENT_OWNER, {AGENT_OWNER: [replace(action, execute_offset_ticks=offset)]}
                 )
                 battle.native.pause()
                 return result
@@ -587,7 +593,7 @@ class FirstLight(gym.Env):
                 last_error = error
                 if "not queued" not in str(error) or attempt == 2:
                     raise
-                battle.step_actor(0, {0: [self._action_v1.wait(0)]})
+                battle.step_actor(AGENT_OWNER, {AGENT_OWNER: [self._action_v1.wait(0)]})
         raise last_error
 
     def _elixir_rate(self, tick):
@@ -657,36 +663,36 @@ class FirstLight(gym.Env):
         """
         if action1 is None:
             return self._scripted_action(native_now)  # 热身期：随机脚本
-        mask1 = self._battle.action_mask(1)
+        mask1 = self._battle.action_mask(OPP_OWNER)
         if getattr(mask1, "hand_slots", None) is None:
             self._opp_last = "not_ready_skip"
             return None  # 决策窗未就绪：不提交，死线自然过期
         slot, cx, cy = self._decode(action1)
         if not self._legal(slot, cx, cy, mask1):
             self._opp_last = "selfplay_illegal"
-            return self._action_v1.wait(1, ticks=10, execute_offset_ticks=3)
+            return self._action_v1.wait(OPP_OWNER, ticks=10, execute_offset_ticks=3)
         if slot == -1:
-            entity, ability_id = self._resolve_ability_owner(1, mask1)
+            entity, ability_id = self._resolve_ability_owner(OPP_OWNER, mask1)
             if entity is None:
-                return self._action_v1.wait(1, ticks=10, execute_offset_ticks=3)
+                return self._action_v1.wait(OPP_OWNER, ticks=10, execute_offset_ticks=3)
             self._opp_last = f"ability:{ability_id[:24]}"
             return self._action_v1(
-                owner=1, kind="activate_ability", source_entity=entity,
+                owner=OPP_OWNER, kind="activate_ability", source_entity=entity,
                 ability_id=ability_id, next_decision_ticks=10,
             )
-        rp1 = next(p for p in native_now["players"] if p["owner"] == 1)
+        rp1 = next(p for p in native_now["players"] if p["owner"] == OPP_OWNER)
         hand_card = next((c for c in rp1["hand"] if c["handIndex"] == slot), None)
         if hand_card is None:
-            return self._action_v1.wait(1, ticks=10, execute_offset_ticks=3)
+            return self._action_v1.wait(OPP_OWNER, ticks=10, execute_offset_ticks=3)
         self._opp_plays += 1
         self._opp_last = f"selfplay:{slot}"
         return self._action_v1.play(
-            owner=1, hand_slot=slot, grid=(cx, cy), card_id=hand_card["cardId"],
+            owner=OPP_OWNER, hand_slot=slot, grid=(cx, cy), card_id=hand_card["cardId"],
             next_decision_ticks=10,
         )
 
     def _resolve_ability_owner(self, owner, mask):
-        table = self._ability_by_entity if owner == 0 else self._ability_by_entity_1
+        table = self._ability_by_entity if owner == AGENT_OWNER else self._ability_by_entity_1
         for entity in sorted(set(int(s) for s in mask.ability_sources)):
             ability_id = table.get(entity)
             if ability_id is not None:
@@ -714,7 +720,7 @@ class FirstLight(gym.Env):
     def _track_abilities_owner(self, obs0, owner):
         try:
             player = next(p for p in obs0.players if p.owner == owner)
-            table = self._ability_by_entity if owner == 0 else self._ability_by_entity_1
+            table = self._ability_by_entity if owner == AGENT_OWNER else self._ability_by_entity_1
             table.clear()
             table.update({
                 int(st.source_entity): str(st.ability_id)
@@ -722,10 +728,10 @@ class FirstLight(gym.Env):
                 if st.source_entity is not None
             })
         except Exception:  # noqa: BLE001 -- 快照失败只影响技能位解析，不影响主流程
-            (self._ability_by_entity if owner == 0 else self._ability_by_entity_1).clear()
+            (self._ability_by_entity if owner == AGENT_OWNER else self._ability_by_entity_1).clear()
 
     def _assemble(self, obs0, is_first, done, terminated):
-        player = next(p for p in obs0.players if p.owner == 0)
+        player = next(p for p in obs0.players if p.owner == AGENT_OWNER)
         elixir = player.elixir_exact if player.elixir_exact is not None else 0.0
         return {
             "image": self._capture(),
@@ -775,7 +781,7 @@ class FirstLight(gym.Env):
 
     def _hand_ids(self, native_now):
         """owner-0 当前手牌的卡池索引（空/未知 = 0 号 UNK），供 actor 卡头查嵌入。"""
-        hand = next(p for p in native_now["players"] if p["owner"] == 0)["hand"]
+        hand = next(p for p in native_now["players"] if p["owner"] == AGENT_OWNER)["hand"]
         ids = [DECK_INDEX.get(c["cardId"], 0) for c in hand]
         return np.array((ids + [0] * 4)[:4], dtype=np.int64)
 
@@ -841,8 +847,10 @@ class FirstLight(gym.Env):
         reset_kwargs = {
             "match_config": self._match_config(
                 seed=seed,
-                deck0=deck0,
-                deck1=deck1,
+                # 座位翻转后：引擎 owner-0 = 对手（OPP），owner-1 = agent。
+                # self._deck0 语义是"agent 卡组"，故 MatchConfig 侧交换。
+                deck0=deck1,
+                deck1=deck0,
                 # 座位名显式化：下方渲染=owner-0=本 agent；横幅文字是 HUD
                 # 摆放，不指示归属——观战时以手牌/圣水实测归属为准
                 owner0_name="P0-AGENT",
@@ -874,15 +882,15 @@ class FirstLight(gym.Env):
         self._battle.native.resume()
         while True:
             obs0, _r, terminated, truncated, _i = self._battle.step_actor(
-                0, {0: [self._action_v1.wait(0)]}
+                AGENT_OWNER, {AGENT_OWNER: [self._action_v1.wait(0)]}
             )
             if obs0.tick >= FIRST_PLAYABLE_TICK or terminated or truncated:
                 break
         self._battle.native.set_speed(self._speed)       # 游玩期速度（引擎保持运行）
-        self._mask = self._battle.action_mask(0)
+        self._mask = self._battle.action_mask(AGENT_OWNER)
         native_now = self._battle.native.observe()
         image = self._capture()
-        obs0_player = next(p for p in obs0.players if p.owner == 0)
+        obs0_player = next(p for p in obs0.players if p.owner == AGENT_OWNER)
         obs = {
             "image": image,
             "is_first": np.bool_(True),
@@ -898,9 +906,9 @@ class FirstLight(gym.Env):
         self._track_abilities(obs0)
         self._t0_begin(seed, self._deck0, self._deck1)
         if self._opp_policy == "selfplay":
-            self._mask1 = self._battle.action_mask(1)
-            self._track_abilities_owner(obs0, 1)
-            p1c = next(p for p in obs0.players if p.owner == 1)
+            self._mask1 = self._battle.action_mask(OPP_OWNER)
+            self._track_abilities_owner(obs0, OPP_OWNER)
+            p1c = next(p for p in obs0.players if p.owner == OPP_OWNER)
             self._last_obs1 = {
                 "image": image,
                 "is_first": np.bool_(True),
@@ -908,11 +916,11 @@ class FirstLight(gym.Env):
                 "is_terminal": np.bool_(False),
                 "elixir": np.array([float(np.clip(float(p1c.elixir_exact or 0.0), 0.0, 10.0))], dtype=np.float32),
                 "elixir_rate": np.array([self._elixir_rate(obs0.tick)], dtype=np.float32),
-                "hand_ids": self._hand_ids_owner(native_now, 1),
+                "hand_ids": self._hand_ids_owner(native_now, OPP_OWNER),
                 "deck_ids": np.array([DECK_INDEX[c] for c in self._deck1], dtype=np.int64),
                 "action_mask": self._mask_flat(self._mask1),
             }
-        self._align_log_tick(obs0.tick, engine_elixir=float(next(p for p in obs0.players if p.owner == 0).elixir_exact or 0.0))
+        self._align_log_tick(obs0.tick, engine_elixir=float(next(p for p in obs0.players if p.owner == AGENT_OWNER).elixir_exact or 0.0))
         if self._episodes % 25 == 1:  # 覆盖审计抽样：每 25 局打印一次卡组对（coverage sentinel）
             print(f"FirstLight: ep{self._episodes} decks pair-hash="
                   f"{hash((self._deck0, self._deck1)) & 0xffffff:x} "
@@ -985,10 +993,10 @@ class FirstLight(gym.Env):
         else:
             opp = None
 
-        def with_opp(a0_list):
-            d = {0: a0_list}
+        def with_opp(agent_list):
+            d = {AGENT_OWNER: agent_list}
             if opp is not None:
-                d[1] = [opp]
+                d[OPP_OWNER] = [opp]
             return d
 
         if legal:
@@ -1001,16 +1009,16 @@ class FirstLight(gym.Env):
                 else:
                     entity, ability_id = resolved
                     play = self._action_v1(
-                        owner=0, kind="activate_ability", source_entity=entity,
+                        owner=AGENT_OWNER, kind="activate_ability", source_entity=entity,
                         ability_id=ability_id, next_decision_ticks=10,
                     )
             else:
-                rp0 = next(p for p in native_now["players"] if p["owner"] == 0)
+                rp0 = next(p for p in native_now["players"] if p["owner"] == AGENT_OWNER)
                 hand_card = next(c for c in rp0["hand"] if c["handIndex"] == slot)
                 # next_decision_ticks=10：固定 10 tick 决策节奏（2Hz@speed 1.0）——保证对局在
                 # time_limit 内到达终局（±1 奖励才存在），并与 4Hz 协议一致
                 play = self._action_v1.play(
-                    owner=0, hand_slot=slot, grid=(cx, cy), card_id=hand_card["cardId"],
+                    owner=AGENT_OWNER, hand_slot=slot, grid=(cx, cy), card_id=hand_card["cardId"],
                     next_decision_ticks=10,
                 )
             from dataclasses import replace
@@ -1020,21 +1028,21 @@ class FirstLight(gym.Env):
             for attempt in range(3):
                 offset = 1 + attempt * 2
                 try:
-                    result = self._battle.step_actor(0, with_opp([replace(play, execute_offset_ticks=offset)]))
+                    result = self._battle.step_actor(AGENT_OWNER, with_opp([replace(play, execute_offset_ticks=offset)]))
                     break
                 except BattleEnvError as error:
                     # 决策死线竞态（偶发）：降级为等待。环境绝不因智能体动作而崩溃。
-                    result = self._battle.step_actor(0, with_opp([self._action_v1.wait(0, ticks=10, execute_offset_ticks=3)]))
+                    result = self._battle.step_actor(AGENT_OWNER, with_opp([self._action_v1.wait(0, ticks=10, execute_offset_ticks=3)]))
                     break
                 except Exception as error:  # noqa: BLE001
                     last_error = error
                     if "not queued" not in str(error) or attempt == 2:
                         raise
-                    self._battle.step_actor(0, {0: [self._action_v1.wait(0)]})
+                    self._battle.step_actor(AGENT_OWNER, {AGENT_OWNER: [self._action_v1.wait(0)]})
             obs0, reward, terminated, truncated, info = result
         else:
             obs0, reward, terminated, truncated, info = self._battle.step_actor(
-                0, with_opp([self._action_v1.wait(0, ticks=10, execute_offset_ticks=3)])
+                AGENT_OWNER, with_opp([self._action_v1.wait(0, ticks=10, execute_offset_ticks=3)])
             )
 
         self._track_abilities(obs0)
@@ -1045,12 +1053,12 @@ class FirstLight(gym.Env):
             # 自动重开下一局（ParallelEnv 惰性重置语义），终局奖励已在本步交付。
             self._needs_reset = True
             self._t0_end(reward, terminated, truncated, info)
-        self._mask = self._battle.action_mask(0)
-        self._mask1 = self._battle.action_mask(1) if self._opp_policy == "selfplay" else None
+        self._mask = self._battle.action_mask(AGENT_OWNER)
+        self._mask1 = self._battle.action_mask(OPP_OWNER) if self._opp_policy == "selfplay" else None
         reward = np.float32(reward)
         done = bool(terminated)
         image = self._capture()
-        player = next(p for p in obs0.players if p.owner == 0)
+        player = next(p for p in obs0.players if p.owner == AGENT_OWNER)
         obs = {
             "image": image,
             "is_first": np.bool_(False),
@@ -1064,8 +1072,8 @@ class FirstLight(gym.Env):
             "action_mask": self._mask_flat(),
         }
         if self._mask1 is not None:
-            self._track_abilities_owner(obs0, 1)
-            p1c = next(p for p in obs0.players if p.owner == 1)
+            self._track_abilities_owner(obs0, OPP_OWNER)
+            p1c = next(p for p in obs0.players if p.owner == OPP_OWNER)
             obs["is_first"] = obs["is_first"]  # noqa: FURB122 -- keep dtype
             self._last_obs1 = {
                 "image": image,
@@ -1074,11 +1082,11 @@ class FirstLight(gym.Env):
                 "is_terminal": np.bool_(terminated),
                 "elixir": np.array([float(np.clip(float(p1c.elixir_exact or 0.0), 0.0, 10.0))], dtype=np.float32),
                 "elixir_rate": np.array([self._elixir_rate(obs0.tick)], dtype=np.float32),
-                "hand_ids": self._hand_ids_owner(native_now, 1),
+                "hand_ids": self._hand_ids_owner(native_now, OPP_OWNER),
                 "deck_ids": np.array([DECK_INDEX[c] for c in self._deck1], dtype=np.int64),
                 "action_mask": self._mask_flat(self._mask1),
             }
-        self._align_log_tick(obs0.tick, engine_elixir=float(next(p for p in obs0.players if p.owner == 0).elixir_exact or 0.0))
+        self._align_log_tick(obs0.tick, engine_elixir=float(next(p for p in obs0.players if p.owner == AGENT_OWNER).elixir_exact or 0.0))
         self._last_obs = obs
         if done and self._episodes % 20 == 0:  # 每 20 局采样一次终局诊断
             try:
