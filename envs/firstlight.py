@@ -458,14 +458,14 @@ class FirstLight(gym.Env):
                 return self._action_v1.wait(OPP_OWNER, ticks=10, execute_offset_ticks=3)
             slot, cx, cy = choices[int(rng.integers(len(choices)))]
             try:
-                hand = next(p for p in (native_now or self._battle.native.observe())["players"] if p["owner"] == 1)["hand"]
+                hand = next(p for p in (native_now or self._battle.native.observe())["players"] if p["owner"] == OPP_OWNER)["hand"]
                 card_id = next(c["cardId"] for c in hand if c["handIndex"] == slot)
             except Exception:  # noqa: BLE001 -- 手牌读取失败时引擎通常也接受缺省
                 card_id = 0
             self._opp_plays += 1
             self._opp_last = "play"
             return self._action_v1.play(
-                owner=1, hand_slot=slot, grid=(cx, cy), card_id=card_id, next_decision_ticks=10,
+                owner=OPP_OWNER, hand_slot=slot, grid=(cx, cy), card_id=card_id, next_decision_ticks=10,
                 execute_offset_ticks=3,
             )
         except Exception as error:  # noqa: BLE001 -- 对手故障绝不带崩采集
@@ -957,6 +957,23 @@ class FirstLight(gym.Env):
         try:
             return self._step_inner(action, action1=action1)
         except (RunnerError, BattleEnvError, TimeoutError) as error:
+            if "another owner" in str(error):
+                import traceback
+                tb = error.__traceback__
+                while tb:
+                    loc = tb.tb_frame.f_locals
+                    if "owner" in loc and "actions" in loc:
+                        acts = loc["actions"]
+                        seq = acts if isinstance(acts, (list, tuple)) else (
+                            [v[0] for v in acts.values()] if hasattr(acts, "values") else [acts])
+                        print(f"FRAME owner={loc['owner']}", flush=True)
+                        for a in seq:
+                            try:
+                                print(f"  act kind={a.kind} owner={a.owner} slot={a.hand_slot}", flush=True)
+                            except Exception:
+                                print("  act <unprintable>", flush=True)
+                    tb = tb.tb_next
+                traceback.print_exc()
             print(
                 f"FirstLight: engine failure ({str(error)[:120]}); "
                 "restarting engine, episode aborted",
@@ -1016,6 +1033,8 @@ class FirstLight(gym.Env):
             d = {AGENT_OWNER: agent_list}
             if opp is not None:
                 d[OPP_OWNER] = [opp]
+            if os.environ.get("CR_DEBUG_COMPOUND"):
+                print(f"DEBUG with_opp keys={ {k: [(a.kind.name, a.owner) for a in v] for k, v in d.items()} } opp_owner={getattr(opp, 'owner', None)}", flush=True)
             return d
 
         if legal:
@@ -1048,6 +1067,8 @@ class FirstLight(gym.Env):
                 offset = 1 + attempt * 2
                 try:
                     result = self._battle.step_actor(AGENT_OWNER, with_opp([replace(play, execute_offset_ticks=offset)]))
+                    if os.environ.get("CR_DEBUG_COMPOUND"):
+                        print(f"DEBUG submit ok offset={offset} compound={ {k: [(a.kind.name, a.owner) for a in v] for k, v in with_opp([]).items()} } play_owner={play.owner}", flush=True)
                     break
                 except BattleEnvError as error:
                     # 决策死线竞态（偶发）：降级为等待。环境绝不因智能体动作而崩溃。
