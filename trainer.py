@@ -46,10 +46,14 @@ class OnlineTrainer:
                 return  # 数据太少
             probes = []        # KL 探针序列（待 snapshot KL 探针产出后接入）
             wm_plateau = False  # loss/dyn、loss/rew 斜率探针接入前恒 False → 必 shadow
-            sel = self._selector.select(
-                stats_rows, probes, wm_plateau,
-                score_fn=self._selector_score_fn(agent, envs),
-                agent_deck=list(envs._envs[0]._deck0))
+            score_many, score_one = self._selector_score_fn(agent, envs)
+            t_sel = time.perf_counter()
+            sel = self._selector.select(stats_rows, probes, wm_plateau,
+                                        score_fn=score_one,
+                                        batch_score_fn=score_many,
+                                        agent_deck=list(envs._envs[0]._deck0))
+            round_ms = (time.perf_counter() - t_sel) * 1000
+            self.logger.scalar("league/round_ms", round_ms)
             info = sel["info"]
             self.logger.scalar("league/round", info["round"])
             self.logger.scalar("league/gates_ok", 1.0 if info["gates_ok"] else 0.0)
@@ -64,12 +68,16 @@ class OnlineTrainer:
             traceback.print_exc()
 
     def _selector_score_fn(self, agent, envs):
-        """V(s_open, d) 直接读出打分回调。开局帧 = env 战场截取（(176,128,3)）。"""
+        """V(s_open, d) 打分回调。开局帧 = env 战场截取（(176,128,3)）。
+
+        score_many(decks) 批量版：912 邻居拼一个 batch（爬山一步 ≈ 两次
+        batch 前向），消除逐条串行的采集阻塞。
+        """
         import numpy as np
+        from envs.firstlight import DECK_INDEX
         state = {"feat": None}
 
-        def score(deck):
-            from envs.firstlight import DECK_INDEX
+        def _opening_feat():
             if state["feat"] is None:
                 frame = envs._envs[0]._capture()          # (176,128,3) uint8 战场
                 feat_img = torch.from_numpy(frame).unsqueeze(0).float() / 255.0
@@ -82,13 +90,21 @@ class OnlineTrainer:
                 st, de, _ = agent.rssm.obs_step(st, de, torch.zeros(1, agent.act_dim),
                                                 embed, torch.zeros(1, dtype=torch.bool))
                 state["feat"] = agent.rssm.get_feat(st, de)
-            ids = torch.tensor([[DECK_INDEX[c] for c in deck]], dtype=torch.long)
-            with torch.no_grad():
-                v = agent.value(state["feat"], ids, torch.zeros_like(ids),
-                                drop_opp=None).mode().squeeze(-1)
-            return float(v)
+            return state["feat"]
 
-        return score
+        def score(deck):
+            return score_many([deck])[0]
+
+        def score_many(decks):
+            feat = _opening_feat().repeat(len(decks), 1)   # (N,F)
+            ids = torch.tensor([[DECK_INDEX[c] for c in d] for d in decks],
+                               dtype=torch.long)           # (N,8)
+            with torch.no_grad():
+                v = agent.value(feat, ids, torch.zeros_like(ids),
+                                drop_opp=None).mode().squeeze(-1)
+            return [float(x) for x in v]
+
+        return score_many, score
 
     def eval(self, agent, train_step):
         """Run evaluation episodes.

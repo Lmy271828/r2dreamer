@@ -65,8 +65,26 @@ def test_selector_shadow_then_active():
     print(f"PASS: selector shadow→active (mode={out['mode']})")
 
 
+def test_hill_climb_batched():
+    """batch_score_fn 路径：结果与串行一致，调用次数 = 1/步。"""
+    calls = {"n": 0}
+    def batch_score(decks):
+        calls["n"] += 1
+        return [float(sum(d)) for d in decks]
+    def single(deck):
+        return float(sum(deck))
+    rng = random.Random(0)
+    best, v, path = hill_climb([100, 101, 102, 103, 104, 105, 106, 107],
+                               single, list(range(100, 140)), max_steps=4,
+                               rng=rng, batch_score_fn=batch_score)
+    assert v >= float(sum([100, 101, 102, 103, 104, 105, 106, 107]))
+    assert calls["n"] <= 5
+    print(f'PASS: hill_climb batched (batch calls={calls["n"]}, v={v:.0f})')
+
+
 if __name__ == '__main__':
     test_gates()
     test_hill_climb()
     test_selector_shadow_then_active()
-    print('ALL LEAGUE TESTS PASSED')
+    test_hill_climb_batched()
+

@@ -87,7 +87,8 @@ def build_pool(stats_rows: list[dict], min_games: int = 10) -> dict:
 # ----------------------------------------------------------------- 爬山 ----
 
 def hill_climb(start_deck: list[int], score_fn, candidates: list[int],
-               max_steps: int = 8, rng: random.Random | None = None):
+               max_steps: int = 8, rng: random.Random | None = None,
+               batch_score_fn=None):
     """单卡置换爬山（docs/deck_selection.md §4）。
 
     score_fn(deck) -> float（标量评分）；邻居 = 任一槽位 × 任一未用候选卡
@@ -114,11 +115,19 @@ def hill_climb(start_deck: list[int], score_fn, candidates: list[int],
                 neighbors.append(cand)
         rng.shuffle(neighbors)
         improved = None
-        for cand in neighbors:
-            v = score_fn(cand)
-            if v > best_v + 1e-9:
-                if improved is None or v > improved[1]:
+        if batch_score_fn is not None:
+            values = batch_score_fn(neighbors)
+            ranked = sorted(zip(neighbors, values), key=lambda x: -x[1])
+            for cand, v in ranked:
+                if v > best_v + 1e-9:
                     improved = (cand, v)
+                    break
+        else:
+            for cand in neighbors:
+                v = score_fn(cand)
+                if v > best_v + 1e-9:
+                    if improved is None or v > improved[1]:
+                        improved = (cand, v)
         if improved is None:
             break
         best, best_v = improved[0], improved[1]
@@ -144,7 +153,8 @@ class DeckSelector:
         self.rounds = 0
 
     def select(self, stats_rows: list[dict], probes: list[tuple[int, float]],
-               wm_plateau: bool, score_fn, agent_deck: list[int]):
+               wm_plateau: bool, score_fn, agent_deck: list[int],
+               batch_score_fn=None):
         """返回 dict(mode, deck0, deck1, info)。deck1 = PFSP 加权抽的对手卡组。"""
         self.rounds += 1
         pool = build_pool(stats_rows)
@@ -166,7 +176,8 @@ class DeckSelector:
             start = agent_deck
         best, best_v, path = hill_climb(start, score_fn,
                                         candidates=sorted({c for d in pool["diverse"] for c in d["deck"]}),
-                                        max_steps=self.max_steps, rng=self.rng)
+                                        max_steps=self.max_steps, rng=self.rng,
+                                        batch_score_fn=batch_score_fn)
         info["path"] = path
 
         # PFSP 加权抽对手卡组（真实战绩：劣势 + 少样本不确定性加成）
