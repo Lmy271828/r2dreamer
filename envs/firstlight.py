@@ -1021,7 +1021,7 @@ class FirstLight(gym.Env):
                 resolved = self._resolve_ability()
                 if resolved is None:
                     # 快照过期等极端情形：降级 WAIT（仍走同一条提交通道）
-                    play = self._action_v1.wait(0, ticks=10, execute_offset_ticks=3)
+                    play = self._action_v1.wait(AGENT_OWNER, ticks=10, execute_offset_ticks=3)
                 else:
                     entity, ability_id = resolved
                     play = self._action_v1(
@@ -1048,7 +1048,7 @@ class FirstLight(gym.Env):
                     break
                 except BattleEnvError as error:
                     # 决策死线竞态（偶发）：降级为等待。环境绝不因智能体动作而崩溃。
-                    result = self._battle.step_actor(AGENT_OWNER, with_opp([self._action_v1.wait(0, ticks=10, execute_offset_ticks=3)]))
+                    result = self._battle.step_actor(AGENT_OWNER, with_opp([self._action_v1.wait(AGENT_OWNER, ticks=10, execute_offset_ticks=3)]))
                     break
                 except Exception as error:  # noqa: BLE001
                     last_error = error
@@ -1058,7 +1058,7 @@ class FirstLight(gym.Env):
             obs0, reward, terminated, truncated, info = result
         else:
             obs0, reward, terminated, truncated, info = self._battle.step_actor(
-                AGENT_OWNER, with_opp([self._action_v1.wait(0, ticks=10, execute_offset_ticks=3)])
+                AGENT_OWNER, with_opp([self._action_v1.wait(AGENT_OWNER, ticks=10, execute_offset_ticks=3)])
             )
 
         self._track_abilities(obs0)
