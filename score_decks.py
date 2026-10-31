@@ -39,7 +39,7 @@ def load_agent(checkpoint: Path, device: str = "cpu"):
 
     with hydra.initialize(version_base=None, config_path="configs", job_name="score_decks"):
         cfg = hydra.compose(config_name="configs", overrides=[
-            "env=dmc_vision", "model=size12M", f"device={device}",
+            "env=firstlight_swarm", "model=size12M", f"device={device}",
             "model.compile=false", "model.rep_loss=r2dreamer",
         ])
     obs_space = gym.spaces.Dict({
@@ -130,7 +130,10 @@ def main() -> int:
         values = agent.value(feat, d_ids, o_ids, drop_opp=None).mode().squeeze(-1)
 
     order = torch.argsort(values, descending=True)
-    name = lambda cid: CARD_NAMES.get(cid, str(cid))
+    from native_runner.card_names import CARD_NAMES as _CN
+    def name(cid):
+        v = _CN.get(cid, cid)
+        return v if isinstance(v, str) else str(v)
     print(f"{'rank':>4} {'V(s_open,d)':>12}  deck")
     out = []
     for rk, i in enumerate(order.tolist(), 1):
