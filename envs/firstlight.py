@@ -995,6 +995,9 @@ class FirstLight(gym.Env):
         """
 
         self._ensure_battle()
+        # action1 经 wrapper 链透传的是 one-hot 数组（trainer 传法），归一化为扁平索引
+        if action1 is not None and hasattr(action1, "argmax"):
+            action1 = int(np.argmax(action1).item())
         slot, cx, cy = self._decode(action)
         legal = self._legal(slot, cx, cy)
 
