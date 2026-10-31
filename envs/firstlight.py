@@ -588,9 +588,9 @@ class FirstLight(gym.Env):
 
         battle = self._battle
         battle.native.resume()
-        battle.step_actor(AGENT_OWNER, {AGENT_OWNER: [self._action_v1.wait(0)]})
+        battle.step_actor(AGENT_OWNER, {AGENT_OWNER: [self._action_v1.wait(AGENT_OWNER)]})
         if action is None:
-            result = battle.step_actor(AGENT_OWNER, {AGENT_OWNER: [self._action_v1.wait(0)]})
+            result = battle.step_actor(AGENT_OWNER, {AGENT_OWNER: [self._action_v1.wait(AGENT_OWNER)]})
             battle.native.pause()
             return result
 
@@ -609,7 +609,7 @@ class FirstLight(gym.Env):
                 last_error = error
                 if "not queued" not in str(error) or attempt == 2:
                     raise
-                battle.step_actor(AGENT_OWNER, {AGENT_OWNER: [self._action_v1.wait(0)]})
+                battle.step_actor(AGENT_OWNER, {AGENT_OWNER: [self._action_v1.wait(AGENT_OWNER)]})
         raise last_error
 
     def _elixir_rate(self, tick):
@@ -898,7 +898,7 @@ class FirstLight(gym.Env):
         self._battle.native.resume()
         while True:
             obs0, _r, terminated, truncated, _i = self._battle.step_actor(
-                AGENT_OWNER, {AGENT_OWNER: [self._action_v1.wait(0)]}
+                AGENT_OWNER, {AGENT_OWNER: [self._action_v1.wait(AGENT_OWNER)]}
             )
             if obs0.tick >= FIRST_PLAYABLE_TICK or terminated or truncated:
                 break
@@ -1054,7 +1054,7 @@ class FirstLight(gym.Env):
                     last_error = error
                     if "not queued" not in str(error) or attempt == 2:
                         raise
-                    self._battle.step_actor(AGENT_OWNER, {AGENT_OWNER: [self._action_v1.wait(0)]})
+                    self._battle.step_actor(AGENT_OWNER, {AGENT_OWNER: [self._action_v1.wait(AGENT_OWNER)]})
             obs0, reward, terminated, truncated, info = result
         else:
             obs0, reward, terminated, truncated, info = self._battle.step_actor(
