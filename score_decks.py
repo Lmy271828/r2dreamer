@@ -60,8 +60,11 @@ def load_agent(checkpoint: Path, device: str = "cpu"):
     return agent
 
 
-def opening_feat(agent, frame_png: bytes | None):
-    """开局态特征：frame → encoder → RSSM 后验一步（prev_action=WAIT）。"""
+def opening_state(agent, frame_png: bytes | None):
+    """开局态：frame → encoder → RSSM 后验一步（prev_action=WAIT）。
+
+    返回 (feat, stoch, deter)：feat 供直接读出，(stoch, deter) 供 rollout。
+    """
     import io
     from PIL import Image
     from native_runner.vision.capture import scale_crop, crop_resize_rect
@@ -82,7 +85,77 @@ def opening_feat(agent, frame_png: bytes | None):
         reset = torch.zeros(1, dtype=torch.bool)
         prev_action = torch.zeros(1, agent.act_dim)
         stoch, deter, _ = agent.rssm.obs_step(stoch, deter, prev_action, embed, reset)
-        return agent.rssm.get_feat(stoch, deter)                # (1,F)
+        return agent.rssm.get_feat(stoch, deter), stoch, deter  # (1,F), (1,S,K), (1,D)
+
+
+def opening_feat(agent, frame_png: bytes | None):
+    feat, _, _ = opening_state(agent, frame_png)
+    return feat
+
+
+def rollout_value(agent, stoch0, deter0, deck, k_rollouts, horizon, device):
+    """单卡组的想象 MC 估值：K 条轨迹，reward 头累计 + 视界 bootstrap。
+
+    手牌循环精确模拟（deck 顺序已知）：出牌槽 i 的卡进队尾，队首补位。
+    掩码近似：WAIT + 全部手牌槽 × 己方半场+桥位（无费用表，affordability
+    未建模——已记录的 v1 限制）。
+    返回 (mean, std, per-trajectory list)。
+    """
+    import torch.nn.functional as F
+
+    dim = agent.value.deck_enc.d
+    G = 1 - 1 / int(agent.horizon)
+    K, T = k_rollouts, horizon
+
+    # 初始手牌/队列（卡池索引；deck 入参为原生 card id）
+    pool = deck_pool_ids_of(deck)
+    hand = [list(pool[:4]) for _ in range(K)]
+    queue = [list(pool[4:]) for _ in range(K)]
+    elix = [5.0] * K
+    st = stoch0.repeat(K, 1, 1)
+    de = deter0.repeat(K, 1)
+    returns = torch.zeros(K)
+    gamma_pow = 1.0
+
+    opp_ids = torch.zeros(K, 8, dtype=torch.long, device=device)   # 边缘模式：UNK
+    for t in range(T):
+        feat = agent.rssm.get_feat(st, de)                         # (K,F)
+        hand_t = torch.tensor([h + [0] * (4 - len(h)) for h in hand],
+                              dtype=torch.long, device=device)     # (K,4)
+        mask = torch.zeros(K, 2306)
+        mask[:, 0] = 1
+        for i in range(4):
+            base = 1 + i * 576
+            mask[:, base:base + 576] = 1                          # v1: 全格合法近似
+        dist = agent.actor(feat, mask=mask, hand_ids=hand_t)
+        a = dist.rsample()                                        # (K,2306) straight-through
+        st, de = agent.rssm.img_step(st, de, a)
+        r = agent.reward(feat).mode().reshape(-1)                  # (K,)
+        c = agent.cont(feat).mean.reshape(-1)                      # (K,) Bernoulli 均值
+        returns += gamma_pow * r * c
+        gamma_pow *= float(G)
+        # 手牌循环：按采样槽位换卡（ability/wait 不动牌）
+        idx = a.argmax(dim=-1).tolist()
+        for kx, flat in enumerate(idx):
+            if 1 <= flat < 1 + 4 * 576:
+                off = flat - 1
+                slot, cell = off // 576, off % 576
+                if slot < len(hand[kx]):
+                    played = hand[kx][slot]
+                    if queue[kx]:
+                        hand[kx][slot] = queue[kx].pop(0)
+                    queue[kx].append(played)
+
+    v_tail = agent.value(agent.rssm.get_feat(st, de),
+                         torch.tensor([pool] * K, dtype=torch.long),
+                         opp_ids, drop_opp=None).mode().squeeze(-1)
+    total = returns + (G ** T) * v_tail
+    return float(total.mean()), float(total.std()), total.tolist()
+
+
+def deck_pool_ids_of(deck):
+    from envs.firstlight import DECK_INDEX
+    return [DECK_INDEX[c] for c in deck]
 
 
 def main() -> int:
@@ -94,6 +167,9 @@ def main() -> int:
     ap.add_argument("--conditional", action="store_true",
                     help="完整 matchup 模式（需 --opp-json）；缺省 = 边缘模式 V(s,d0)")
     ap.add_argument("--opp-json", type=Path)
+    ap.add_argument("--rollout", type=int, default=0,
+                    help="每卡组 K 条想象轨迹的 MC 估值（0 = 仅直接读出）")
+    ap.add_argument("--horizon", type=int, default=60, help="rollout 步数")
     ap.add_argument("--device", default="cpu")
     args = ap.parse_args()
 
@@ -129,6 +205,16 @@ def main() -> int:
     with torch.no_grad():
         values = agent.value(feat, d_ids, o_ids, drop_opp=None).mode().squeeze(-1)
 
+    st0 = de0 = None
+    rollouts = {}
+    if args.rollout > 0:
+        _, st0, de0 = opening_state(agent, frame)
+        print(f"rollout: K={args.rollout} T={args.horizon}（手牌循环精确模拟）", flush=True)
+        for di, d in enumerate(decks):
+            mu, sd, _ = rollout_value(agent, st0, de0, d, args.rollout, args.horizon, args.device)
+            rollouts[di] = (mu, sd)
+            print(f"  deck#{di}: rollout {mu:+.4f} ± {sd:.4f}", flush=True)
+
     order = torch.argsort(values, descending=True)
     from native_runner.card_names import CARD_NAMES as _CN
     def name(cid):
@@ -138,8 +224,10 @@ def main() -> int:
     out = []
     for rk, i in enumerate(order.tolist(), 1):
         cards = ", ".join(name(c) for c in decks[i])
-        print(f"{rk:>4} {values[i].item():>12.5f}  [{cards}]")
-        out.append({"rank": rk, "value": values[i].item(), "deck": list(decks[i])})
+        ro = f" | rollout {rollouts[i][0]:+.4f}±{rollouts[i][1]:.4f}" if i in rollouts else ""
+        print(f"{rk:>4} {values[i].item():>12.5f}  [{cards}]{ro}")
+        out.append({"rank": rk, "value": values[i].item(), "deck": list(decks[i]),
+                    **({"rollout_mean": rollouts[i][0], "rollout_std": rollouts[i][1]} if i in rollouts else {})})
     dest = args.checkpoint.parent / "deck_scores.json"
     dest.write_text(json.dumps({"checkpoint": str(args.checkpoint), "scores": out},
                                ensure_ascii=False, indent=1), encoding="utf-8")
