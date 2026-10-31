@@ -1,5 +1,6 @@
 import copy
 import threading
+from pathlib import Path
 import time
 
 import torch
@@ -120,6 +121,21 @@ class OnlineTrainer:
         selfplay = getattr(envs, "selfplay", False)
         self._next_snapshot_update = self.snapshot_every
         self._opp_agent = None
+        # M5 断点续训的联赛成熟态：恢复时优先读本 run 的 league_state.pt
+        # （对手快照权重+计数器）；跨 run 恢复且无存档时，以恢复的策略本体
+        # 为成熟对手直接激活（跳过热身）——"联赛已成熟"语义。
+        self.resume_ckpt = getattr(self, "resume_ckpt", "") or ""
+        self._league_file = None
+        if selfplay and self.resume_ckpt:
+            lf = Path(self.resume_ckpt).parent / "league_state.pt"
+            if lf.exists():
+                self._league_file = lf
+
+        def save_league_state(opp_agent, opp_episodes):
+            torch.save({"opp_agent_state_dict": opp_agent.state_dict(),
+                        "opp_episodes": opp_episodes},
+                       Path(self.logger._logdir) / "league_state.pt")
+        self._save_league_state = save_league_state
         self._opp_state = None
         self._opp_episodes = 0
         self._opp_refresh_at = None
@@ -247,15 +263,25 @@ class OnlineTrainer:
             if selfplay:
                 warmup = getattr(envs, "selfplay_warmup", 40)
                 refresh = getattr(envs, "selfplay_refresh", 30)
-                if self._opp_agent is None and self._opp_episodes >= warmup:
+                if self._opp_agent is None and (self._league_file is not None or self._opp_episodes >= warmup):
                     self._opp_agent = copy.deepcopy(agent)
                     self._opp_agent.eval()
                     self._opp_state = self._opp_agent.get_initial_state(envs.env_num)
+                    if self._league_file is not None:
+                        blob = torch.load(self._league_file, map_location=agent.device, weights_only=False)
+                        self._opp_agent.load_state_dict(blob["opp_agent_state_dict"])
+                        self._opp_episodes = int(blob["opp_episodes"])
+                        self._league_file = None  # 只恢复一次
+                        print(f"M5: league restored from archive (opp_episodes={self._opp_episodes})", flush=True)
+                    else:
+                        self._opp_agent.load_state_dict(agent.state_dict())  # 跨 run 恢复：以恢复本体为成熟对手
+                        print(f"M5: selfplay opponent activated with RESUMED mature weights (cross-run, no league archive)", flush=True)
                     self._opp_refresh_at = self._opp_episodes + refresh
-                    print(f"M5: selfplay opponent activated after {self._opp_episodes} episodes", flush=True)
+                    self._save_league_state(self._opp_agent, self._opp_episodes)
                 elif self._opp_agent is not None and self._opp_episodes >= self._opp_refresh_at:
                     self._opp_agent.load_state_dict(agent.state_dict())
                     self._opp_refresh_at = self._opp_episodes + refresh
+                    self._save_league_state(self._opp_agent, self._opp_episodes)
                     print(f"M5: opponent snapshot refreshed at {self._opp_episodes} episodes", flush=True)
                 if self._opp_agent is not None:
                     obs1 = envs.pop_obs1()

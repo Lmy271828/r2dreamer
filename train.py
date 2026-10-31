@@ -63,6 +63,7 @@ def main(config):
         print(f"Resumed weights+optim from {resume_ckpt} (replay buffer restarts empty)", flush=True)
 
     policy_trainer = OnlineTrainer(config.trainer, replay_buffer, logger, logdir, train_envs, eval_envs)
+    policy_trainer.resume_ckpt = resume_ckpt  # 供 trainer 恢复联赛成熟态（league_state.pt）
     policy_trainer.begin(agent)
 
     items_to_save = {
