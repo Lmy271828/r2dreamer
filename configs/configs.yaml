@@ -34,6 +34,8 @@ buffer:
 
 trainer:
   steps: ${env.steps}
+  snapshot_every: 300   # ~30min @fps3：周期归档 checkpoint（emergence_probes T2）
+  snapshot_keep: 8
   pretrain: 0
   eval_every: 1e4
   eval_episode_num: ${env.eval_episode_num}

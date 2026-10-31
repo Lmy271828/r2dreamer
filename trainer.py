@@ -18,6 +18,10 @@ class OnlineTrainer:
         self.eval_every = int(config.eval_every)
         self.eval_episode_num = int(config.eval_episode_num)
         self.video_pred_log = bool(config.video_pred_log)
+        # 涌现探针基建（emergence_probes.md）：周期性归档 checkpoint，供
+        # 学习顺序分析。每 snapshot_every 次更新存一份，保留最近 snapshot_keep 份。
+        self.snapshot_every = int(getattr(config, "snapshot_every", 300) or 0)
+        self.snapshot_keep = int(getattr(config, "snapshot_keep", 8) or 8)
         self.params_hist_log = bool(config.params_hist_log)
         self.batch_length = int(config.batch_length)
         batch_steps = int(config.batch_size * config.batch_length)
@@ -114,6 +118,7 @@ class OnlineTrainer:
         # act1=None（env 回退随机脚本），warmup 后 deepcopy 快照接管，
         # 每 refresh_episodes 局用主策略权重刷新一次。
         selfplay = getattr(envs, "selfplay", False)
+        self._next_snapshot_update = self.snapshot_every
         self._opp_agent = None
         self._opp_state = None
         self._opp_episodes = 0
@@ -175,6 +180,21 @@ class OnlineTrainer:
                                 {"agent_state_dict": agent.state_dict(),
                                  "optims_state_dict": tools.recursively_collect_optim_state_dict(agent)},
                                 self.logger._logdir / "latest.pt")
+                        if (self.snapshot_every
+                                and local_updates >= self._next_snapshot_update):
+                            sdir = self.logger._logdir / "snapshots"
+                            sdir.mkdir(parents=True, exist_ok=True)
+                            torch.save(
+                                {"agent_state_dict": agent.state_dict(),
+                                 "optims_state_dict": tools.recursively_collect_optim_state_dict(agent),
+                                 "updates": local_updates, "step": shared["step"]},
+                                sdir / f"ckpt_u{local_updates}.pt")
+                            self._next_snapshot_update = local_updates + self.snapshot_every
+                            # 保留最近 snapshot_keep 份
+                            snaps = sorted(sdir.glob("ckpt_u*.pt"),
+                                           key=lambda p: p.stat().st_mtime)
+                            for old in snaps[:-self.snapshot_keep]:
+                                old.unlink(missing_ok=True)
                     if update_num == 0:
                         time.sleep(0.02)
             except Exception:  # noqa: BLE001 -- 学习线程死亡绝不能静默
